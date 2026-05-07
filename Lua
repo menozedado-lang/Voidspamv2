@@ -1,0 +1,443 @@
+-- ═══════════════════════════════════════════
+-- RIVALS PROJECTILE BYPASS
+-- Rayfield UI
+-- ═══════════════════════════════════════════
+
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+-- ═══════════════════════════════════════════
+-- SERVICES
+-- ═══════════════════════════════════════════
+local RunService  = game:GetService("RunService")
+local Players     = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+-- ═══════════════════════════════════════════
+-- STATE
+-- ═══════════════════════════════════════════
+local Config = {
+    Enabled          = false,
+    TeleportEnemies  = true,
+    TeleportProj     = true,
+    TeleportFastParts= true,
+    VoidPos          = Vector3.new(9000, 9000, 9000),
+    WhitelistSelf    = true,
+    TargetMode       = "All Enemies",
+    TargetPlayer     = "",
+    SpeedThreshold   = 50,
+}
+
+local trackedParts = {}
+local heartbeatConn = nil
+local childAddedConn = nil
+local childRemovedConn = nil
+local targetPlayerObj = nil
+
+-- ═══════════════════════════════════════════
+-- CORE BYPASS FUNCTIONS
+-- ═══════════════════════════════════════════
+local function getVoidCFrame()
+    return CFrame.new(Config.VoidPos)
+end
+
+local function shouldTargetPlayer(p)
+    if p == LocalPlayer then return false end
+    if Config.TargetMode == "All Enemies" then
+        return true
+    elseif Config.TargetMode == "Specific Player" then
+        return targetPlayerObj ~= nil and p == targetPlayerObj
+    elseif Config.TargetMode == "Nearest Enemy" then
+        -- handled separately
+        return true
+    end
+    return true
+end
+
+local function getNearestEnemy()
+    local myChar = LocalPlayer.Character
+    local myHRP  = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return nil end
+    local nearest = nil
+    local nearestDist = math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LocalPlayer then continue end
+        local chr = p.Character
+        local hrp = chr and chr:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local d = (hrp.Position - myHRP.Position).Magnitude
+            if d < nearestDist then
+                nearestDist = d
+                nearest = p
+            end
+        end
+    end
+    return nearest
+end
+
+-- ═══════════════════════════════════════════
+-- START / STOP
+-- ═══════════════════════════════════════════
+local function stopBypass()
+    if heartbeatConn   then heartbeatConn:Disconnect();   heartbeatConn   = nil end
+    if childAddedConn  then childAddedConn:Disconnect();  childAddedConn  = nil end
+    if childRemovedConn then childRemovedConn:Disconnect(); childRemovedConn = nil end
+    trackedParts = {}
+end
+
+local function startBypass()
+    stopBypass()
+
+    -- Track projectiles added to workspace
+    childAddedConn = workspace.ChildAdded:Connect(function(o)
+        if not o:IsA("BasePart") then return end
+        if o.Name == "CoreProjectile" then
+            trackedParts[o] = true
+        elseif o.Name == "Part" then
+            task.defer(function()
+                if o and o.Parent and o.AssemblyLinearVelocity.Magnitude > Config.SpeedThreshold then
+                    trackedParts[o] = true
+                end
+            end)
+        end
+    end)
+
+    childRemovedConn = workspace.ChildRemoved:Connect(function(o)
+        trackedParts[o] = nil
+    end)
+
+    heartbeatConn = RunService.Heartbeat:Connect(function()
+        pcall(function()
+            local voidCF = getVoidCFrame()
+
+            -- ── Teleport enemies ──
+            if Config.TeleportEnemies then
+                local nearestOnly = Config.TargetMode == "Nearest Enemy" and getNearestEnemy() or nil
+
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p == LocalPlayer then continue end
+
+                    local skip = false
+                    if Config.TargetMode == "Nearest Enemy" then
+                        skip = (p ~= nearestOnly)
+                    elseif Config.TargetMode == "Specific Player" then
+                        skip = (p ~= targetPlayerObj)
+                    end
+
+                    if not skip and p.Character then
+                        local h = p.Character:FindFirstChild("HumanoidRootPart")
+                        if h then
+                            h.CFrame                  = voidCF
+                            h.AssemblyLinearVelocity  = Vector3.zero
+                            h.AssemblyAngularVelocity = Vector3.zero
+                        end
+                    end
+                end
+            end
+
+            -- ── Teleport CoreProjectile ──
+            if Config.TeleportProj then
+                for _, o in ipairs(workspace:GetChildren()) do
+                    if o.Name == "CoreProjectile" and o:IsA("BasePart") then
+                        o.CFrame                 = voidCF
+                        o.AssemblyLinearVelocity = Vector3.zero
+                    end
+                end
+            end
+
+            -- ── Teleport tracked fast parts ──
+            if Config.TeleportFastParts then
+                for p, _ in pairs(trackedParts) do
+                    if p and p.Parent then
+                        p.CFrame                 = voidCF
+                        p.AssemblyLinearVelocity = Vector3.zero
+                    else
+                        trackedParts[p] = nil
+                    end
+                end
+            end
+        end)
+    end)
+end
+
+-- ═══════════════════════════════════════════
+-- RAYFIELD UI
+-- ═══════════════════════════════════════════
+local Window = Rayfield:CreateWindow({
+    Name             = "Rivals Projectile Bypass",
+    LoadingTitle     = "Rivals Bypass",
+    LoadingSubtitle  = "Slingshot · Dagger · Bow",
+    ConfigurationSaving = {
+        Enabled    = true,
+        FolderName = "RivalsProjectileBypass",
+        FileName   = "Config",
+    },
+    KeySystem = false,
+})
+
+-- ═══════════════════════════════════════════
+-- MAIN TAB
+-- ═══════════════════════════════════════════
+local MainTab = Window:CreateTab("Main", "shield")
+
+MainTab:CreateSection("Bypass Control")
+
+MainTab:CreateToggle({
+    Name         = "Enable Bypass",
+    CurrentValue = false,
+    Flag         = "BypassEnabled",
+    Callback     = function(v)
+        Config.Enabled = v
+        if v then
+            startBypass()
+            Rayfield:Notify({
+                Title   = "Bypass Active",
+                Content = "Projectile bypass enabled",
+                Duration = 3,
+            })
+        else
+            stopBypass()
+            Rayfield:Notify({
+                Title   = "Bypass Stopped",
+                Content = "Projectile bypass disabled",
+                Duration = 3,
+            })
+        end
+    end,
+})
+
+MainTab:CreateSection("What Gets Bypassed")
+
+MainTab:CreateToggle({
+    Name         = "Teleport Enemies",
+    CurrentValue = true,
+    Flag         = "TeleportEnemies",
+    Callback     = function(v)
+        Config.TeleportEnemies = v
+    end,
+})
+
+MainTab:CreateToggle({
+    Name         = "Teleport CoreProjectile",
+    CurrentValue = true,
+    Flag         = "TeleportProj",
+    Callback     = function(v)
+        Config.TeleportProj = v
+    end,
+})
+
+MainTab:CreateToggle({
+    Name         = "Teleport Fast Parts",
+    CurrentValue = true,
+    Flag         = "TeleportFastParts",
+    Callback     = function(v)
+        Config.TeleportFastParts = v
+    end,
+})
+
+MainTab:CreateSection("Void Position")
+
+MainTab:CreateSlider({
+    Name         = "Void X",
+    Range        = {1000, 50000},
+    Increment    = 1000,
+    Suffix       = " studs",
+    CurrentValue = 9000,
+    Flag         = "VoidX",
+    Callback     = function(v)
+        Config.VoidPos = Vector3.new(v, Config.VoidPos.Y, Config.VoidPos.Z)
+    end,
+})
+
+MainTab:CreateSlider({
+    Name         = "Void Y",
+    Range        = {1000, 50000},
+    Increment    = 1000,
+    Suffix       = " studs",
+    CurrentValue = 9000,
+    Flag         = "VoidY",
+    Callback     = function(v)
+        Config.VoidPos = Vector3.new(Config.VoidPos.X, v, Config.VoidPos.Z)
+    end,
+})
+
+MainTab:CreateSlider({
+    Name         = "Void Z",
+    Range        = {1000, 50000},
+    Increment    = 1000,
+    Suffix       = " studs",
+    CurrentValue = 9000,
+    Flag         = "VoidZ",
+    Callback     = function(v)
+        Config.VoidPos = Vector3.new(Config.VoidPos.X, Config.VoidPos.Y, v)
+    end,
+})
+
+MainTab:CreateSlider({
+    Name         = "Fast Part Speed Threshold",
+    Range        = {10, 500},
+    Increment    = 5,
+    Suffix       = " studs/s",
+    CurrentValue = 50,
+    Flag         = "SpeedThreshold",
+    Callback     = function(v)
+        Config.SpeedThreshold = v
+    end,
+})
+
+-- ═══════════════════════════════════════════
+-- TARGETS TAB
+-- ═══════════════════════════════════════════
+local TargetsTab = Window:CreateTab("Targets", "crosshair")
+
+TargetsTab:CreateSection("Target Selection")
+
+TargetsTab:CreateDropdown({
+    Name         = "Target Mode",
+    Options      = {"All Enemies", "Nearest Enemy", "Specific Player"},
+    CurrentOption = "All Enemies",
+    Flag         = "TargetMode",
+    Callback     = function(v)
+        Config.TargetMode = v
+        if v == "Specific Player" then
+            Rayfield:Notify({
+                Title   = "Specific Player",
+                Content = "Enter a username in the box below",
+                Duration = 4,
+            })
+        end
+    end,
+})
+
+TargetsTab:CreateInput({
+    Name        = "Specific Player Username",
+    PlaceholderText = "Enter exact username...",
+    RemoveTextAfterFocusLost = false,
+    Flag        = "TargetUsername",
+    Callback    = function(v)
+        Config.TargetPlayer = v
+        targetPlayerObj = nil
+        -- Search for the player
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Name:lower() == v:lower() or p.DisplayName:lower() == v:lower() then
+                targetPlayerObj = p
+                Rayfield:Notify({
+                    Title   = "Target Found",
+                    Content = "Targeting: " .. p.Name,
+                    Duration = 3,
+                })
+                return
+            end
+        end
+        if v ~= "" then
+            Rayfield:Notify({
+                Title   = "Not Found",
+                Content = "Player '"..v.."' not in server",
+                Duration = 3,
+            })
+        end
+    end,
+})
+
+TargetsTab:CreateSection("Player List")
+
+local function buildPlayerList()
+    local names = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            table.insert(names, p.Name)
+        end
+    end
+    return names
+end
+
+-- Refresh player list button
+TargetsTab:CreateButton({
+    Name     = "Refresh Player List",
+    Callback = function()
+        Rayfield:Notify({
+            Title   = "Players in Server",
+            Content = table.concat(buildPlayerList(), ", "),
+            Duration = 5,
+        })
+    end,
+})
+
+TargetsTab:CreateButton({
+    Name     = "Select Nearest Enemy",
+    Callback = function()
+        local nearest = getNearestEnemy()
+        if nearest then
+            Config.TargetMode   = "Specific Player"
+            Config.TargetPlayer = nearest.Name
+            targetPlayerObj     = nearest
+            Rayfield:Notify({
+                Title   = "Target Set",
+                Content = "Now targeting: " .. nearest.Name,
+                Duration = 3,
+            })
+        else
+            Rayfield:Notify({
+                Title   = "No Enemies",
+                Content = "No other players found",
+                Duration = 3,
+            })
+        end
+    end,
+})
+
+-- ═══════════════════════════════════════════
+-- INFO TAB
+-- ═══════════════════════════════════════════
+local InfoTab = Window:CreateTab("Info", "info")
+
+InfoTab:CreateSection("How It Works")
+
+InfoTab:CreateLabel("1. Tracks CoreProjectile in workspace")
+InfoTab:CreateLabel("2. Tracks fast-moving parts (speed > threshold)")
+InfoTab:CreateLabel("3. Every Heartbeat: teleports them to 9000,9000,9000")
+InfoTab:CreateLabel("4. Enemies are also teleported away from you")
+InfoTab:CreateLabel("5. Their projectiles can't reach you")
+InfoTab:CreateLabel("")
+InfoTab:CreateLabel("Works for: Slingshot, Dagger, Bow, Arrow")
+InfoTab:CreateLabel("Does NOT require hookmetamethod")
+
+InfoTab:CreateSection("Tips")
+
+InfoTab:CreateLabel("Use Nearest Enemy mode in 1v1")
+InfoTab:CreateLabel("Use All Enemies in FFA / team modes")
+InfoTab:CreateLabel("Higher void = safer from projectiles")
+InfoTab:CreateLabel("Disable Teleport Enemies if you want")
+InfoTab:CreateLabel("to only block projectiles (not move enemies)")
+
+InfoTab:CreateSection("Emergency")
+
+InfoTab:CreateButton({
+    Name     = "Force Stop Everything",
+    Callback = function()
+        Config.Enabled = false
+        stopBypass()
+        Rayfield:Notify({
+            Title   = "Stopped",
+            Content = "All bypass connections disconnected",
+            Duration = 3,
+        })
+    end,
+})
+
+-- ═══════════════════════════════════════════
+-- WELCOME
+-- ═══════════════════════════════════════════
+Rayfield:Notify({
+    Title   = "Rivals Projectile Bypass",
+    Content = "Loaded! Go to Main tab and enable bypass",
+    Duration = 5,
+})
+
+-- Clean up on character respawn
+LocalPlayer.CharacterAdded:Connect(function()
+    trackedParts = {}
+    if Config.Enabled then
+        task.wait(1)
+        startBypass()
+    end
+end)
