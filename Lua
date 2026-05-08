@@ -1,6 +1,6 @@
 -- ═══════════════════════════════════════════
 -- YUX/OVERKILL PAID BYPASS
--- Rayfield UI
+-- Optimised for low-end devices
 -- ═══════════════════════════════════════════
 
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
@@ -12,8 +12,16 @@ local RunService        = game:GetService("RunService")
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService       = game:GetService("HttpService")
-local Camera            = workspace.CurrentCamera
 local LocalPlayer       = Players.LocalPlayer
+
+-- ═══════════════════════════════════════════
+-- PERFORMANCE CONSTANTS
+-- ═══════════════════════════════════════════
+-- How many heartbeat frames to skip between heavy work
+-- 1 = every frame, 2 = every other frame, etc.
+local PRED_UPDATE_RATE    = 2   -- prediction cache update interval (frames)
+local AVATAR_UPDATE_RATE  = 6   -- avatar RenderStepped work interval (frames)
+local NEAREST_CACHE_TIME  = 0.12 -- seconds between getNearestEnemy recalcs
 
 -- ═══════════════════════════════════════════
 -- STATE
@@ -31,18 +39,15 @@ local Config = {
     WeaponSpeedEnabled = false,
     WeaponSpeedPercent = 100,
 
-    -- Improved Prediction
     PredictionEnabled      = false,
-    PredictionMethod       = "Velocity + Accel",  -- "Velocity Only" / "Velocity + Accel" / "Kalman"
-    PredictionStrength     = 0.1,    -- lead time in seconds
-    PredictionMaxLead      = 8,      -- max stud clamp
+    PredictionMethod       = "Velocity + Accel",
+    PredictionStrength     = 0.09,
+    PredictionLatency      = 0.055,
+    PredictionMaxLead      = 6,
+    PredictionSmoothFactor = 0.45,
+    PredictionAdaptive     = true,
     PredictionShowSphere   = false,
-    PredictionLatency      = 0.065,  -- estimated network latency to add on top
-    PredictionGravityComp  = true,   -- compensate for gravity on projectiles
-    PredictionSmoothFactor = 0.6,    -- smoothing 0=none 1=max (EMA)
-    PredictionAdaptive     = true,   -- auto scale lead by target speed
 
-    -- Avatar Changer
     AvatarVictimId  = 0,
     AvatarHelper    = "",
     AvatarLevel     = 1,
@@ -55,165 +60,189 @@ local Config = {
     AvatarPlatform  = "DESKTOP",
 }
 
-local trackedParts        = {}
-local heartbeatConn       = nil
-local childAddedConn      = nil
-local childRemovedConn    = nil
-local targetPlayerObj     = nil
-local predSphere          = nil
+-- ═══════════════════════════════════════════
+-- FRAME COUNTERS  (cheap throttle, no tick())
+-- ═══════════════════════════════════════════
+local frameCount        = 0
+local predFrameCount    = 0
+local avatarFrameCount  = 0
 
 -- ═══════════════════════════════════════════
--- IMPROVED PREDICTION STATE
+-- BYPASS STATE
 -- ═══════════════════════════════════════════
+local trackedParts     = {}   -- projectile parts to void
+local heartbeatConn    = nil
+local childAddedConn   = nil
+local childRemovedConn = nil
+local targetPlayerObj  = nil
+local predSphere       = nil
 
--- Per-player prediction data
-local predCache = {}
--- {
---   pos      = Vector3   last known position
---   vel      = Vector3   last known velocity
---   accel    = Vector3   estimated acceleration
---   smoothed = Vector3   EMA smoothed predicted point
---   t        = number    last update time
---   history  = {}        ring buffer of {pos, t} for velocity estimation
--- }
+-- Cached nearest enemy (refreshed every NEAREST_CACHE_TIME seconds)
+local nearestEnemyCache     = nil
+local nearestEnemyCacheTime = 0
 
-local HISTORY_SIZE   = 6   -- frames to keep for velocity estimation
-local GRAVITY        = Vector3.new(0, -workspace.Gravity, 0)
+-- Pre-built player list cache (updated on join/leave)
+local playerListCache = {}
+
+local function rebuildPlayerList()
+    playerListCache = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            table.insert(playerListCache, p)
+        end
+    end
+end
+
+rebuildPlayerList()
+
+Players.PlayerAdded:Connect(function()   rebuildPlayerList() end)
+Players.PlayerRemoving:Connect(function() task.defer(rebuildPlayerList) end)
+
+-- ═══════════════════════════════════════════
+-- PREDICTION STATE
+-- ═══════════════════════════════════════════
+local predCache    = {}
+local HISTORY_SIZE = 5
 
 local function initPredCache(player)
     predCache[player] = {
         pos      = Vector3.zero,
         vel      = Vector3.zero,
         accel    = Vector3.zero,
-        smoothed = Vector3.zero,
-        t        = tick(),
+        smoothed = nil,
         history  = {},
+        dirty    = false,
     }
 end
 
--- Weighted least-squares velocity from position history
-local function estimateVelocityFromHistory(history)
-    if #history < 2 then return Vector3.zero end
-    -- Simple finite difference over last two samples
-    local newest = history[#history]
-    local oldest = history[1]
-    local dt     = newest.t - oldest.t
-    if dt <= 0 then return Vector3.zero end
-    return (newest.pos - oldest.pos) / dt
-end
-
--- Estimate acceleration from velocity history
-local function estimateAccelFromHistory(history)
-    if #history < 3 then return Vector3.zero end
-    local n   = #history
-    local h1  = history[n]
-    local h2  = history[n - 1]
-    local h3  = history[n - 2]
-    local dt1 = h1.t - h2.t
-    local dt2 = h2.t - h3.t
-    if dt1 <= 0 or dt2 <= 0 then return Vector3.zero end
-    local v1 = (h1.pos - h2.pos) / dt1
-    local v2 = (h2.pos - h3.pos) / dt2
-    return (v1 - v2) / ((dt1 + dt2) * 0.5)
-end
-
-local function updatePredCache(player, hrp)
+-- Runs every PRED_UPDATE_RATE frames (not every frame)
+local function updatePredCacheForPlayer(player, hrp)
     local now = tick()
     local pos = hrp.Position
 
     if not predCache[player] then initPredCache(player) end
     local cache = predCache[player]
 
-    -- Push to history ring buffer
-    table.insert(cache.history, { pos = pos, t = now })
-    if #cache.history > HISTORY_SIZE then
-        table.remove(cache.history, 1)
+    -- Ring buffer push
+    local h = cache.history
+    h[#h + 1] = { pos = pos, t = now }
+    if #h > HISTORY_SIZE then table.remove(h, 1) end
+
+    -- Velocity from oldest→newest
+    if #h >= 2 then
+        local dt = h[#h].t - h[1].t
+        if dt > 0 then
+            -- Blend history vel with assembly vel (assembly is instant, history is smooth)
+            local histVel = (h[#h].pos - h[1].pos) / dt
+            cache.vel     = histVel * 0.65 + hrp.AssemblyLinearVelocity * 0.35
+        end
+    else
+        cache.vel = hrp.AssemblyLinearVelocity
     end
 
-    local dt = now - cache.t
-    cache.t  = now
+    -- Acceleration from last 3 samples
+    if #h >= 3 then
+        local n   = #h
+        local dt1 = h[n].t   - h[n-1].t
+        local dt2 = h[n-1].t - h[n-2].t
+        if dt1 > 0 and dt2 > 0 then
+            local v1      = (h[n].pos   - h[n-1].pos) / dt1
+            local v2      = (h[n-1].pos - h[n-2].pos) / dt2
+            cache.accel   = (v1 - v2) / ((dt1 + dt2) * 0.5)
+        end
+    end
 
-    -- Estimate vel / accel from history for smoother results
-    local newVel   = estimateVelocityFromHistory(cache.history)
-    local newAccel = estimateAccelFromHistory(cache.history)
-
-    -- Blend with assembly velocity for responsiveness
-    local assemblyVel = hrp.AssemblyLinearVelocity
-    -- Weight: 70% history-estimated, 30% assembly (assembly can spike)
-    newVel = newVel * 0.7 + assemblyVel * 0.3
-
-    cache.vel   = newVel
-    cache.accel = newAccel
     cache.pos   = pos
+    cache.dirty = true
 end
 
---[[
-    Main prediction function.
-    Returns a world-space Vector3 of where the target will be
-    at (now + leadTime + latency).
-]]
+-- Runs every frame but only reads pre-computed cache (cheap)
 local function getPredictedPosition(player)
-    local chr = player.Character
-    if not chr then return nil end
-    local hrp = chr:FindFirstChild("HumanoidRootPart")
-    if not hrp then return nil end
-
-    updatePredCache(player, hrp)
     local cache = predCache[player]
+    if not cache then return nil end
 
-    -- Total lead time = user setting + latency compensation
     local totalLead = Config.PredictionStrength + Config.PredictionLatency
 
-    -- Adaptive scaling: faster targets need less lead (they reach point sooner)
-    -- slower targets need more
     if Config.PredictionAdaptive then
         local speed = cache.vel.Magnitude
-        -- Scale: at 0 studs/s use full lead, at 50 studs/s scale to 0.6x
-        local scale = math.clamp(1 - (speed / 200), 0.4, 1.4)
+        local scale = math.clamp(1 - speed / 200, 0.4, 1.4)
         totalLead   = totalLead * scale
     end
 
     local predicted
 
-    if Config.PredictionMethod == "Velocity Only" then
-        -- Simple: pos + vel * t
+    local method = Config.PredictionMethod
+    if method == "Velocity Only" then
         predicted = cache.pos + cache.vel * totalLead
-
-    elseif Config.PredictionMethod == "Velocity + Accel" then
-        -- Kinematic: pos + vel*t + 0.5*accel*t²
+    elseif method == "Velocity + Accel" then
         predicted = cache.pos
-            + cache.vel  * totalLead
-            + cache.accel * 0.5 * totalLead * totalLead
-
-    elseif Config.PredictionMethod == "Kalman" then
-        -- Simplified Kalman-like: blend kinematic prediction
-        -- with a dampened accel to reduce overshoot
+            + cache.vel   * totalLead
+            + cache.accel * (0.5 * totalLead * totalLead)
+    else -- Kalman
         local dampedAccel = cache.accel * 0.5
         predicted = cache.pos
-            + cache.vel  * totalLead
-            + dampedAccel * 0.5 * totalLead * totalLead
-    else
-        predicted = cache.pos + cache.vel * totalLead
+            + cache.vel   * totalLead
+            + dampedAccel * (0.5 * totalLead * totalLead)
     end
 
-    -- Clamp max lead distance
+    -- Clamp max lead
     local delta = predicted - cache.pos
-    if delta.Magnitude > Config.PredictionMaxLead then
-        predicted = cache.pos + delta.Unit * Config.PredictionMaxLead
+    local mag   = delta.Magnitude
+    if mag > Config.PredictionMaxLead then
+        predicted = cache.pos + delta * (Config.PredictionMaxLead / mag)
     end
 
-    -- EMA smoothing to reduce jitter
+    -- EMA smoothing
     local sf = Config.PredictionSmoothFactor
     if sf > 0 then
-        if cache.smoothed == Vector3.zero then
-            cache.smoothed = predicted
-        else
-            cache.smoothed = cache.smoothed * sf + predicted * (1 - sf)
-        end
+        cache.smoothed = cache.smoothed
+            and cache.smoothed * sf + predicted * (1 - sf)
+            or predicted
         predicted = cache.smoothed
     end
 
     return predicted
+end
+
+-- ═══════════════════════════════════════════
+-- NEAREST ENEMY  (cached, not recalc every frame)
+-- ═══════════════════════════════════════════
+local function getNearestEnemy()
+    local now = tick()
+    if now - nearestEnemyCacheTime < NEAREST_CACHE_TIME then
+        return nearestEnemyCache
+    end
+
+    local myChar = LocalPlayer.Character
+    local myHRP  = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP then
+        nearestEnemyCache     = nil
+        nearestEnemyCacheTime = now
+        return nil
+    end
+
+    local myPos         = myHRP.Position
+    local nearest       = nil
+    local nearestDistSq = math.huge  -- use squared distance to skip sqrt
+
+    for _, p in ipairs(playerListCache) do
+        local chr = p.Character
+        local hrp = chr and chr:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local dx    = hrp.Position.X - myPos.X
+            local dy    = hrp.Position.Y - myPos.Y
+            local dz    = hrp.Position.Z - myPos.Z
+            local distSq = dx*dx + dy*dy + dz*dz
+            if distSq < nearestDistSq then
+                nearestDistSq = distSq
+                nearest       = p
+            end
+        end
+    end
+
+    nearestEnemyCache     = nearest
+    nearestEnemyCacheTime = now
+    return nearest
 end
 
 -- ═══════════════════════════════════════════
@@ -250,16 +279,16 @@ local ConfigFolder = "unnamed"
 local ConfigFile   = ConfigFolder .. "/rivals_config.json"
 
 local SaveableKeys = {
-    "Enabled", "TeleportEnemies", "TeleportProj", "TeleportFastParts",
-    "SpeedThreshold", "TargetMode", "TargetPlayer",
-    "WeaponSpeedEnabled", "WeaponSpeedPercent",
-    "PredictionEnabled", "PredictionMethod", "PredictionStrength",
-    "PredictionMaxLead", "PredictionShowSphere", "PredictionLatency",
-    "PredictionGravityComp", "PredictionSmoothFactor", "PredictionAdaptive",
-    "VoidPosX", "VoidPosY", "VoidPosZ",
-    "AvatarVictimId", "AvatarHelper", "AvatarLevel", "AvatarStreak",
-    "AvatarElo", "AvatarKeys", "AvatarPremium", "AvatarVerified",
-    "AvatarUnlockAll", "AvatarPlatform",
+    "Enabled","TeleportEnemies","TeleportProj","TeleportFastParts",
+    "SpeedThreshold","TargetMode","TargetPlayer",
+    "WeaponSpeedEnabled","WeaponSpeedPercent",
+    "PredictionEnabled","PredictionMethod","PredictionStrength",
+    "PredictionMaxLead","PredictionShowSphere","PredictionLatency",
+    "PredictionSmoothFactor","PredictionAdaptive",
+    "VoidPosX","VoidPosY","VoidPosZ",
+    "AvatarVictimId","AvatarHelper","AvatarLevel","AvatarStreak",
+    "AvatarElo","AvatarKeys","AvatarPremium","AvatarVerified",
+    "AvatarUnlockAll","AvatarPlatform",
 }
 
 local function saveConfig()
@@ -267,15 +296,15 @@ local function saveConfig()
         if not isfolder(ConfigFolder) then makefolder(ConfigFolder) end
         local data = {}
         for _, key in ipairs(SaveableKeys) do
-            if key == "VoidPosX" then data[key] = Config.VoidPos.X
+            if     key == "VoidPosX" then data[key] = Config.VoidPos.X
             elseif key == "VoidPosY" then data[key] = Config.VoidPos.Y
             elseif key == "VoidPosZ" then data[key] = Config.VoidPos.Z
-            else data[key] = Config[key] end
+            else                          data[key] = Config[key] end
         end
         writefile(ConfigFile, HttpService:JSONEncode(data))
     end)
     if not ok then
-        Rayfield:Notify({ Title = "Save Failed", Content = tostring(err), Duration = 4 })
+        Rayfield:Notify({ Title="Save Failed", Content=tostring(err), Duration=4 })
     end
 end
 
@@ -285,19 +314,14 @@ local function loadConfig()
         if not isfile(ConfigFile) then return end
         local data = HttpService:JSONDecode(readfile(ConfigFile))
         for _, key in ipairs(SaveableKeys) do
-            if key == "VoidPosX" and data[key] then
-                Config.VoidPos = Vector3.new(data[key], Config.VoidPos.Y, Config.VoidPos.Z)
-            elseif key == "VoidPosY" and data[key] then
-                Config.VoidPos = Vector3.new(Config.VoidPos.X, data[key], Config.VoidPos.Z)
-            elseif key == "VoidPosZ" and data[key] then
-                Config.VoidPos = Vector3.new(Config.VoidPos.X, Config.VoidPos.Y, data[key])
-            else
-                if data[key] ~= nil then Config[key] = data[key] end
-            end
+            if     key == "VoidPosX" and data[key] then Config.VoidPos = Vector3.new(data[key], Config.VoidPos.Y, Config.VoidPos.Z)
+            elseif key == "VoidPosY" and data[key] then Config.VoidPos = Vector3.new(Config.VoidPos.X, data[key], Config.VoidPos.Z)
+            elseif key == "VoidPosZ" and data[key] then Config.VoidPos = Vector3.new(Config.VoidPos.X, Config.VoidPos.Y, data[key])
+            elseif data[key] ~= nil then Config[key] = data[key] end
         end
     end)
     if not ok then
-        Rayfield:Notify({ Title = "Load Failed", Content = tostring(err), Duration = 4 })
+        Rayfield:Notify({ Title="Load Failed", Content=tostring(err), Duration=4 })
     end
 end
 
@@ -306,15 +330,15 @@ loadConfig()
 -- ═══════════════════════════════════════════
 -- WEAPON SPEED
 -- ═══════════════════════════════════════════
-local DefaultReloadLengths = { Bow = 0, Daggers = 0.09, Slingshot = 0 }
-local WhitelistedItems     = {"Bow", "Daggers", "Slingshot"}
+local DefaultReloadLengths = { Bow=0, Daggers=0.09, Slingshot=0 }
+local WhitelistedItems     = {"Bow","Daggers","Slingshot"}
 
 local function applyWeaponSpeed(percent)
     pcall(function()
         local ItemLibrary = require(ReplicatedStorage.Modules.ItemLibrary)
         local Items       = rawget(ItemLibrary, "Items")
         if not Items then return end
-        local multiplier  = (300 - percent) / 200
+        local multiplier = (300 - percent) / 200
         for _, Item in Items do
             local Name = Item.Name
             if not table.find(WhitelistedItems, Name) then continue end
@@ -398,31 +422,32 @@ local function stopAvatarChanger()
         avatarOldNamecall = nil
     end
     avatarDecodedData = nil
-    Rayfield:Notify({ Title = "Avatar Changer", Content = "Stopped. Rejoin to fully restore.", Duration = 4 })
+    Rayfield:Notify({ Title="Avatar Changer", Content="Stopped. Rejoin to fully restore.", Duration=4 })
 end
 
 local function startAvatarChanger()
     if avatarActive then stopAvatarChanger() end
-    local victimId = Config.AvatarVictimId
-    if victimId == 0 then
-        Rayfield:Notify({ Title = "Avatar Changer", Content = "Enter a valid Victim User ID first!", Duration = 4 })
+    if Config.AvatarVictimId == 0 then
+        Rayfield:Notify({ Title="Avatar Changer", Content="Enter a valid Victim User ID first!", Duration=4 })
         return
     end
     local fetchOk, fetchErr = pcall(function()
-        local raw         = game:HttpGet("https://users.roblox.com/v1/users/" .. tostring(victimId), true)
+        local raw         = game:HttpGet("https://users.roblox.com/v1/users/"..Config.AvatarVictimId, true)
         avatarDecodedData = HttpService:JSONDecode(raw)
     end)
     if not fetchOk or not avatarDecodedData or not avatarDecodedData.name then
-        Rayfield:Notify({ Title = "Avatar Changer", Content = "Failed to fetch: " .. tostring(fetchErr), Duration = 5 })
+        Rayfield:Notify({ Title="Avatar Changer", Content="Failed: "..tostring(fetchErr), Duration=5 })
         return
     end
+
     local decoded  = avatarDecodedData
     local platform = tostring(Config.AvatarPlatform):upper()
     local friend   = Config.AvatarHelper ~= "" and Players:FindFirstChild(Config.AvatarHelper) or LocalPlayer
     if not friend then
-        Rayfield:Notify({ Title = "Avatar Changer", Content = "Helper not found in server", Duration = 4 })
+        Rayfield:Notify({ Title="Avatar Changer", Content="Helper not found", Duration=4 })
         return
     end
+
     pcall(function()
         friend.Name                  = decoded.name
         friend.UserId                = decoded.id
@@ -463,165 +488,195 @@ local function startAvatarChanger()
             return avatarOldNamecall(self, key)
         end)
     end)
-    avatarRenderConn = RunService.RenderStepped:Connect(function()
-        pcall(function()
-            local plrInst = Players:FindFirstChild(decoded.name)
-            local ctrl    = plrInst and plrInst.Character
-                and plrInst.Character:FindFirstChild("HumanoidRootPart")
-                and plrInst.Character.HumanoidRootPart:FindFirstChild("Nametag")
-                and plrInst.Character.HumanoidRootPart.Nametag:FindFirstChild("Frame")
-                and plrInst.Character.HumanoidRootPart.Nametag.Frame:FindFirstChild("Player")
-                and plrInst.Character.HumanoidRootPart.Nametag.Frame.Player:FindFirstChild("Controls")
-            if ctrl then ctrl.Image = platformImages[platform] or platformImages.DESKTOP end
 
-            local container = LocalPlayer:FindFirstChild("PlayerGui")
-                and LocalPlayer.PlayerGui:FindFirstChild("MainGui")
-                and LocalPlayer.PlayerGui.MainGui:FindFirstChild("MainFrame")
-                and LocalPlayer.PlayerGui.MainGui.MainFrame:FindFirstChild("DuelInterfaces")
-                and LocalPlayer.PlayerGui.MainGui.MainFrame.DuelInterfaces:FindFirstChild("DuelInterface")
-                and LocalPlayer.PlayerGui.MainGui.MainFrame.DuelInterfaces.DuelInterface:FindFirstChild("Scoreboard")
-                and LocalPlayer.PlayerGui.MainGui.MainFrame.DuelInterfaces.DuelInterface.Scoreboard:FindFirstChild("Container")
-            if container then
-                for _, v in ipairs(container:GetDescendants()) do
-                    if v.Name == "Username" and string.find(v.Text, "@" .. decoded.name) then
-                        local c = v.Parent and v.Parent:FindFirstChild("Container")
-                            and v.Parent.Container:FindFirstChild("TeammateSlot")
-                            and v.Parent.Container.TeammateSlot:FindFirstChild("Container")
-                            and v.Parent.Container.TeammateSlot.Container:FindFirstChild("Controls")
-                        if c then c.Image = platformImages[platform] or platformImages.DESKTOP end
-                    end
-                end
+    -- ── Avatar RenderStepped: THROTTLED to every AVATAR_UPDATE_RATE frames ──
+    -- Pre-resolve GUI paths once per loop iteration so we aren't re-walking
+    -- the entire tree every frame
+    local cachedCtrl      = nil
+    local cachedCtrlTime  = 0
+    local CTRL_CACHE_TIME = 2 -- seconds between GUI path re-resolve
+
+    avatarRenderConn = RunService.RenderStepped:Connect(function()
+        avatarFrameCount = avatarFrameCount + 1
+        if avatarFrameCount % AVATAR_UPDATE_RATE ~= 0 then return end
+
+        pcall(function()
+            -- Nametag ctrl (re-resolve every CTRL_CACHE_TIME seconds)
+            local now = tick()
+            if not cachedCtrl or now - cachedCtrlTime > CTRL_CACHE_TIME then
+                local plrInst = Players:FindFirstChild(decoded.name)
+                cachedCtrl = plrInst
+                    and plrInst.Character
+                    and plrInst.Character:FindFirstChild("HumanoidRootPart")
+                    and plrInst.Character.HumanoidRootPart:FindFirstChild("Nametag")
+                    and plrInst.Character.HumanoidRootPart.Nametag:FindFirstChild("Frame")
+                    and plrInst.Character.HumanoidRootPart.Nametag.Frame:FindFirstChild("Player")
+                    and plrInst.Character.HumanoidRootPart.Nametag.Frame.Player:FindFirstChild("Controls")
+                cachedCtrlTime = now
+            end
+            if cachedCtrl then
+                cachedCtrl.Image = platformImages[platform] or platformImages.DESKTOP
             end
 
+            -- Keys display (only if keys override is set)
             if tonumber(Config.AvatarKeys) > 0 then
-                local currency = LocalPlayer:FindFirstChild("PlayerGui")
+                local currency = LocalPlayer.PlayerGui
                     and LocalPlayer.PlayerGui:FindFirstChild("MainGui")
                     and LocalPlayer.PlayerGui.MainGui:FindFirstChild("MainFrame")
                     and LocalPlayer.PlayerGui.MainGui.MainFrame:FindFirstChild("Lobby")
                     and LocalPlayer.PlayerGui.MainGui.MainFrame.Lobby:FindFirstChild("Currency")
                     and LocalPlayer.PlayerGui.MainGui.MainFrame.Lobby.Currency:FindFirstChild("Container")
-                    and LocalPlayer.PlayerGui.MainGui.MainFrame.Lobby.Currency.Container:GetDescendants()
                 if currency then
-                    for _, v in ipairs(currency) do
-                        if v.Name == "Icon" and v.Image == "rbxassetid://17860673529" then
-                            v.Parent.Parent.Title.Text = tostring(Config.AvatarKeys)
+                    for _, v in ipairs(currency:GetChildren()) do
+                        if v:FindFirstChild("Icon") and v.Icon.Image == "rbxassetid://17860673529" then
+                            if v:FindFirstChild("Title") then
+                                v.Title.Text = tostring(Config.AvatarKeys)
+                            end
                         end
                     end
                 end
             end
         end)
     end)
+
     avatarActive = true
-    Rayfield:Notify({ Title = "Avatar Changer", Content = "Now spoofing as: " .. decoded.name, Duration = 4 })
+    Rayfield:Notify({ Title="Avatar Changer", Content="Spoofing as: "..decoded.name, Duration=4 })
 end
 
 -- ═══════════════════════════════════════════
--- CORE BYPASS
+-- SHOULD TARGET PLAYER
 -- ═══════════════════════════════════════════
-local function getVoidCFrame() return CFrame.new(Config.VoidPos) end
-
 local function shouldTargetPlayer(p)
     if p == LocalPlayer then return false end
-    if Config.TargetMode == "Specific Player" then return targetPlayerObj ~= nil and p == targetPlayerObj end
+    if Config.TargetMode == "Specific Player" then
+        return targetPlayerObj ~= nil and p == targetPlayerObj
+    end
     return true
 end
 
-local function getNearestEnemy()
-    local myChar = LocalPlayer.Character
-    local myHRP  = myChar and myChar:FindFirstChild("HumanoidRootPart")
-    if not myHRP then return nil end
-    local nearest, nearestDist = nil, math.huge
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p == LocalPlayer then continue end
-        local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local d = (hrp.Position - myHRP.Position).Magnitude
-            if d < nearestDist then nearestDist = d nearest = p end
-        end
-    end
-    return nearest
-end
-
+-- ═══════════════════════════════════════════
+-- BYPASS START / STOP
+-- ═══════════════════════════════════════════
 local function stopBypass()
     if heartbeatConn    then heartbeatConn:Disconnect()    heartbeatConn    = nil end
     if childAddedConn   then childAddedConn:Disconnect()   childAddedConn   = nil end
     if childRemovedConn then childRemovedConn:Disconnect() childRemovedConn = nil end
-    trackedParts = {}
-    predCache    = {}
+    trackedParts          = {}
+    predCache             = {}
+    nearestEnemyCache     = nil
+    nearestEnemyCacheTime = 0
     cleanupPredSphere()
 end
 
 local function startBypass()
     stopBypass()
+
+    -- Track new projectiles via event (zero per-frame cost)
     childAddedConn = workspace.ChildAdded:Connect(function(o)
         if not o:IsA("BasePart") then return end
         if o.Name == "CoreProjectile" then
             trackedParts[o] = true
         elseif o.Name == "Part" then
+            -- Defer so physics has time to apply velocity
             task.defer(function()
-                if o and o.Parent and o.AssemblyLinearVelocity.Magnitude > Config.SpeedThreshold then
+                if o and o.Parent
+                   and o.AssemblyLinearVelocity.Magnitude > Config.SpeedThreshold then
                     trackedParts[o] = true
                 end
             end)
         end
     end)
+
     childRemovedConn = workspace.ChildRemoved:Connect(function(o)
         trackedParts[o] = nil
     end)
+
+    -- ── Main heartbeat loop (heavily optimised) ──
     heartbeatConn = RunService.Heartbeat:Connect(function()
-        pcall(function()
-            local voidCF      = getVoidCFrame()
-            local nearestOnly = Config.TargetMode == "Nearest Enemy" and getNearestEnemy() or nil
+        frameCount = frameCount + 1
 
-            if Config.PredictionEnabled then
-                local predTarget = Config.TargetMode == "Nearest Enemy" and nearestOnly
-                    or Config.TargetMode == "Specific Player" and targetPlayerObj
-                    or getNearestEnemy()
-                if predTarget then
-                    updatePredSphere(getPredictedPosition(predTarget))
-                else
-                    updatePredSphere(nil)
+        -- ── STEP 1: Update prediction cache (throttled) ──
+        if Config.PredictionEnabled and frameCount % PRED_UPDATE_RATE == 0 then
+            for _, p in ipairs(playerListCache) do
+                local chr = p.Character
+                local hrp = chr and chr:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    updatePredCacheForPlayer(p, hrp)
                 end
-            else
-                cleanupPredSphere()
             end
+        end
 
-            if Config.TeleportEnemies then
-                for _, p in ipairs(Players:GetPlayers()) do
-                    if not shouldTargetPlayer(p) then continue end
-                    local skip = false
-                    if Config.TargetMode == "Nearest Enemy" then skip = p ~= nearestOnly
-                    elseif Config.TargetMode == "Specific Player" then skip = p ~= targetPlayerObj end
-                    if not skip and p.Character then
-                        local h = p.Character:FindFirstChild("HumanoidRootPart")
-                        if h then
-                            if Config.PredictionEnabled then
-                                local pred = getPredictedPosition(p)
-                                h.CFrame = pred and CFrame.new(pred.X, Config.VoidPos.Y, pred.Z) or voidCF
+        -- Resolve nearest once per frame (uses cache internally)
+        local nearestOnly = Config.TargetMode == "Nearest Enemy" and getNearestEnemy() or nil
+
+        -- ── STEP 2: Update prediction sphere (throttled every 3 frames) ──
+        if Config.PredictionEnabled and Config.PredictionShowSphere and frameCount % 3 == 0 then
+            local predTarget = nearestOnly
+                or (Config.TargetMode == "Specific Player" and targetPlayerObj)
+                or nearestEnemyCache
+            if predTarget then
+                updatePredSphere(getPredictedPosition(predTarget))
+            end
+        elseif not Config.PredictionEnabled then
+            cleanupPredSphere()
+        end
+
+        -- ── STEP 3: Teleport enemies ──
+        if Config.TeleportEnemies then
+            local vx = Config.VoidPos.X
+            local vy = Config.VoidPos.Y
+            local vz = Config.VoidPos.Z
+
+            for _, p in ipairs(playerListCache) do
+                if not shouldTargetPlayer(p) then continue end
+
+                local skip = false
+                if Config.TargetMode == "Nearest Enemy" then
+                    skip = p ~= nearestOnly
+                elseif Config.TargetMode == "Specific Player" then
+                    skip = p ~= targetPlayerObj
+                end
+
+                if not skip and p.Character then
+                    local h = p.Character:FindFirstChild("HumanoidRootPart")
+                    if h then
+                        if Config.PredictionEnabled then
+                            local pred = getPredictedPosition(p)
+                            if pred then
+                                h.CFrame = CFrame.new(pred.X, vy, pred.Z)
                             else
-                                h.CFrame = voidCF
+                                h.CFrame = CFrame.new(vx, vy, vz)
                             end
-                            h.AssemblyLinearVelocity  = Vector3.zero
-                            h.AssemblyAngularVelocity = Vector3.zero
+                        else
+                            h.CFrame = CFrame.new(vx, vy, vz)
                         end
+                        h.AssemblyLinearVelocity  = Vector3.zero
+                        h.AssemblyAngularVelocity = Vector3.zero
                     end
                 end
             end
+        end
 
-            if Config.TeleportProj or Config.TeleportFastParts then
-                for part, _ in pairs(trackedParts) do
-                    if part and part.Parent then
-                        local isProj = part.Name == "CoreProjectile"
-                        if (isProj and Config.TeleportProj) or (not isProj and Config.TeleportFastParts) then
-                            part.CFrame                 = voidCF
-                            part.AssemblyLinearVelocity = Vector3.zero
-                        end
-                    else
-                        trackedParts[part] = nil
+        -- ── STEP 4: Teleport tracked projectile parts ──
+        if Config.TeleportProj or Config.TeleportFastParts then
+            local vx = Config.VoidPos.X
+            local vy = Config.VoidPos.Y
+            local vz = Config.VoidPos.Z
+            local voidCF = CFrame.new(vx, vy, vz)
+
+            for part in pairs(trackedParts) do
+                if part and part.Parent then
+                    local isProj = part.Name == "CoreProjectile"
+                    if (isProj and Config.TeleportProj) or
+                       (not isProj and Config.TeleportFastParts) then
+                        part.CFrame                 = voidCF
+                        part.AssemblyLinearVelocity = Vector3.zero
                     end
+                else
+                    trackedParts[part] = nil
                 end
             end
-        end)
+        end
     end)
 end
 
@@ -631,12 +686,8 @@ end
 local Window = Rayfield:CreateWindow({
     Name            = "yux/overkill paid bypass",
     LoadingTitle    = "yux/overkill",
-    LoadingSubtitle = "Slingshot · Dagger · Bow",
-    ConfigurationSaving = {
-        Enabled    = false,
-        FolderName = "unnamed",
-        FileName   = "rivals_config",
-    },
+    LoadingSubtitle = "Optimised · Low-End Friendly",
+    ConfigurationSaving = { Enabled=false, FolderName="unnamed", FileName="rivals_config" },
     KeySystem = false,
 })
 
@@ -646,62 +697,46 @@ local Window = Rayfield:CreateWindow({
 local MainTab = Window:CreateTab("Main", "shield")
 
 MainTab:CreateSection("Bypass Control")
-
 MainTab:CreateToggle({
-    Name = "Enable Bypass", CurrentValue = Config.Enabled, Flag = "BypassEnabled",
-    Callback = function(v)
+    Name="Enable Bypass", CurrentValue=Config.Enabled, Flag="BypassEnabled",
+    Callback=function(v)
         Config.Enabled = v
         if v then startBypass() else stopBypass() end
-        Rayfield:Notify({
-            Title   = v and "Bypass Active" or "Bypass Stopped",
-            Content = v and "Projectile bypass enabled" or "Projectile bypass disabled",
-            Duration = 3,
-        })
+        Rayfield:Notify({ Title=v and "Bypass Active" or "Bypass Stopped",
+            Content=v and "Enabled" or "Disabled", Duration=3 })
     end,
 })
 
 MainTab:CreateSection("What Gets Bypassed")
-
-MainTab:CreateToggle({
-    Name = "Teleport Enemies", CurrentValue = Config.TeleportEnemies, Flag = "TeleportEnemies",
-    Callback = function(v) Config.TeleportEnemies = v end,
-})
-
-MainTab:CreateToggle({
-    Name = "Teleport CoreProjectile", CurrentValue = Config.TeleportProj, Flag = "TeleportProj",
-    Callback = function(v) Config.TeleportProj = v end,
-})
-
-MainTab:CreateToggle({
-    Name = "Teleport Fast Parts", CurrentValue = Config.TeleportFastParts, Flag = "TeleportFastParts",
-    Callback = function(v) Config.TeleportFastParts = v end,
-})
+MainTab:CreateToggle({ Name="Teleport Enemies",       CurrentValue=Config.TeleportEnemies,   Flag="TeleportEnemies",   Callback=function(v) Config.TeleportEnemies=v end })
+MainTab:CreateToggle({ Name="Teleport CoreProjectile", CurrentValue=Config.TeleportProj,       Flag="TeleportProj",      Callback=function(v) Config.TeleportProj=v end })
+MainTab:CreateToggle({ Name="Teleport Fast Parts",     CurrentValue=Config.TeleportFastParts, Flag="TeleportFastParts", Callback=function(v) Config.TeleportFastParts=v end })
 
 MainTab:CreateSection("Void Position")
+MainTab:CreateSlider({ Name="Void X", Range={1000,50000}, Increment=1000, Suffix=" studs", CurrentValue=Config.VoidPos.X, Flag="VoidX",
+    Callback=function(v) Config.VoidPos=Vector3.new(v,Config.VoidPos.Y,Config.VoidPos.Z) end })
+MainTab:CreateSlider({ Name="Void Y", Range={1000,50000}, Increment=1000, Suffix=" studs", CurrentValue=Config.VoidPos.Y, Flag="VoidY",
+    Callback=function(v) Config.VoidPos=Vector3.new(Config.VoidPos.X,v,Config.VoidPos.Z) end })
+MainTab:CreateSlider({ Name="Void Z", Range={1000,50000}, Increment=1000, Suffix=" studs", CurrentValue=Config.VoidPos.Z, Flag="VoidZ",
+    Callback=function(v) Config.VoidPos=Vector3.new(Config.VoidPos.X,Config.VoidPos.Y,v) end })
+MainTab:CreateSlider({ Name="Fast Part Speed Threshold", Range={10,500}, Increment=5, Suffix=" studs/s", CurrentValue=Config.SpeedThreshold, Flag="SpeedThreshold",
+    Callback=function(v) Config.SpeedThreshold=v end })
 
-MainTab:CreateSlider({
-    Name = "Void X", Range = {1000,50000}, Increment = 1000, Suffix = " studs",
-    CurrentValue = Config.VoidPos.X, Flag = "VoidX",
-    Callback = function(v) Config.VoidPos = Vector3.new(v, Config.VoidPos.Y, Config.VoidPos.Z) end,
+MainTab:CreateSection("Performance")
+MainTab:CreateDropdown({
+    Name="Prediction Update Rate", Flag="PredUpdateRate",
+    Options={"Every Frame","Every 2 Frames (default)","Every 3 Frames","Every 4 Frames"},
+    CurrentOption="Every 2 Frames (default)",
+    Callback=function(v)
+        if     v=="Every Frame"            then PRED_UPDATE_RATE=1
+        elseif v=="Every 2 Frames (default)" then PRED_UPDATE_RATE=2
+        elseif v=="Every 3 Frames"         then PRED_UPDATE_RATE=3
+        elseif v=="Every 4 Frames"         then PRED_UPDATE_RATE=4 end
+        Rayfield:Notify({ Title="Update Rate", Content="Prediction: "..v, Duration=3 })
+    end,
 })
-
-MainTab:CreateSlider({
-    Name = "Void Y", Range = {1000,50000}, Increment = 1000, Suffix = " studs",
-    CurrentValue = Config.VoidPos.Y, Flag = "VoidY",
-    Callback = function(v) Config.VoidPos = Vector3.new(Config.VoidPos.X, v, Config.VoidPos.Z) end,
-})
-
-MainTab:CreateSlider({
-    Name = "Void Z", Range = {1000,50000}, Increment = 1000, Suffix = " studs",
-    CurrentValue = Config.VoidPos.Z, Flag = "VoidZ",
-    Callback = function(v) Config.VoidPos = Vector3.new(Config.VoidPos.X, Config.VoidPos.Y, v) end,
-})
-
-MainTab:CreateSlider({
-    Name = "Fast Part Speed Threshold", Range = {10,500}, Increment = 5, Suffix = " studs/s",
-    CurrentValue = Config.SpeedThreshold, Flag = "SpeedThreshold",
-    Callback = function(v) Config.SpeedThreshold = v end,
-})
+MainTab:CreateLabel("Higher skip = better FPS, slightly less accuracy")
+MainTab:CreateLabel("Recommended: Every 2 Frames for HvH")
 
 -- ═══════════════════════════════════════════
 -- WEAPON SPEED TAB
@@ -709,336 +744,141 @@ MainTab:CreateSlider({
 local SpeedTab = Window:CreateTab("Weapon Speed", "zap")
 
 SpeedTab:CreateSection("Bow · Daggers · Slingshot")
-
-SpeedTab:CreateToggle({
-    Name = "Enable Weapon Speed", CurrentValue = Config.WeaponSpeedEnabled, Flag = "WeaponSpeedEnabled",
-    Callback = function(v)
-        Config.WeaponSpeedEnabled = v
+SpeedTab:CreateToggle({ Name="Enable Weapon Speed", CurrentValue=Config.WeaponSpeedEnabled, Flag="WeaponSpeedEnabled",
+    Callback=function(v)
+        Config.WeaponSpeedEnabled=v
         if v then applyWeaponSpeed(Config.WeaponSpeedPercent) else resetWeaponSpeed() end
-        Rayfield:Notify({
-            Title   = v and "Weapon Speed ON" or "Weapon Speed OFF",
-            Content = v and ("Speed → " .. Config.WeaponSpeedPercent .. "%") or "Reset to default",
-            Duration = 3,
-        })
-    end,
-})
-
-SpeedTab:CreateSlider({
-    Name = "Weapon Speed %", Range = {0,300}, Increment = 1, Suffix = "%",
-    CurrentValue = Config.WeaponSpeedPercent, Flag = "WeaponSpeedPercent",
-    Callback = function(v)
-        Config.WeaponSpeedPercent = v
-        if Config.WeaponSpeedEnabled then applyWeaponSpeed(v) end
-    end,
-})
-
+        Rayfield:Notify({ Title=v and "Speed ON" or "Speed OFF",
+            Content=v and ("→ "..Config.WeaponSpeedPercent.."%") or "Reset", Duration=3 })
+    end })
+SpeedTab:CreateSlider({ Name="Weapon Speed %", Range={0,300}, Increment=1, Suffix="%", CurrentValue=Config.WeaponSpeedPercent, Flag="WeaponSpeedPercent",
+    Callback=function(v) Config.WeaponSpeedPercent=v if Config.WeaponSpeedEnabled then applyWeaponSpeed(v) end end })
 SpeedTab:CreateSection("Presets")
-SpeedTab:CreateButton({ Name = "Normal (100%)", Callback = function() Config.WeaponSpeedPercent=100 if Config.WeaponSpeedEnabled then applyWeaponSpeed(100) end end })
-SpeedTab:CreateButton({ Name = "Fast (200%)",   Callback = function() Config.WeaponSpeedPercent=200 if Config.WeaponSpeedEnabled then applyWeaponSpeed(200) end end })
-SpeedTab:CreateButton({ Name = "Max (300%)",    Callback = function() Config.WeaponSpeedPercent=300 if Config.WeaponSpeedEnabled then applyWeaponSpeed(300) end end })
-
+SpeedTab:CreateButton({ Name="Normal (100%)", Callback=function() Config.WeaponSpeedPercent=100 if Config.WeaponSpeedEnabled then applyWeaponSpeed(100) end end })
+SpeedTab:CreateButton({ Name="Fast (200%)",   Callback=function() Config.WeaponSpeedPercent=200 if Config.WeaponSpeedEnabled then applyWeaponSpeed(200) end end })
+SpeedTab:CreateButton({ Name="Max (300%)",    Callback=function() Config.WeaponSpeedPercent=300 if Config.WeaponSpeedEnabled then applyWeaponSpeed(300) end end })
 SpeedTab:CreateSection("Info")
-SpeedTab:CreateLabel("0%   = Slowest  (3x default reload)")
-SpeedTab:CreateLabel("100% = Default  (normal reload speed)")
-SpeedTab:CreateLabel("300% = Fastest  (near-instant reload)")
+SpeedTab:CreateLabel("0% = Slowest · 100% = Default · 300% = Instant")
 
 -- ═══════════════════════════════════════════
--- PREDICTION TAB  (fully rebuilt)
+-- PREDICTION TAB
 -- ═══════════════════════════════════════════
 local PredTab = Window:CreateTab("Prediction", "crosshair")
 
 PredTab:CreateSection("Enable")
-
-PredTab:CreateToggle({
-    Name = "Enable Prediction", CurrentValue = Config.PredictionEnabled, Flag = "PredictionEnabled",
-    Callback = function(v)
-        Config.PredictionEnabled = v
-        if not v then cleanupPredSphere() predCache = {} end
-        Rayfield:Notify({
-            Title   = v and "Prediction ON" or "Prediction OFF",
-            Content = v and "Leading enemy positions" or "Disabled",
-            Duration = 3,
-        })
-    end,
-})
+PredTab:CreateToggle({ Name="Enable Prediction", CurrentValue=Config.PredictionEnabled, Flag="PredictionEnabled",
+    Callback=function(v)
+        Config.PredictionEnabled=v
+        if not v then cleanupPredSphere() predCache={} end
+        Rayfield:Notify({ Title=v and "Prediction ON" or "Prediction OFF", Content=v and "Active" or "Disabled", Duration=3 })
+    end })
 
 PredTab:CreateSection("Algorithm")
-
 PredTab:CreateDropdown({
-    Name          = "Prediction Method",
-    Options       = {"Velocity Only", "Velocity + Accel", "Kalman"},
-    CurrentOption = Config.PredictionMethod,
-    Flag          = "PredictionMethod",
-    Callback      = function(v)
-        Config.PredictionMethod = v
-        predCache = {} -- reset cache when switching method
-        Rayfield:Notify({
-            Title   = "Method Changed",
-            Content = "Using: " .. v,
-            Duration = 3,
-        })
-    end,
+    Name="Prediction Method", Options={"Velocity Only","Velocity + Accel","Kalman"},
+    CurrentOption=Config.PredictionMethod, Flag="PredictionMethod",
+    Callback=function(v) Config.PredictionMethod=v predCache={} end,
 })
 
 PredTab:CreateSection("Timing")
-
-PredTab:CreateSlider({
-    Name = "Lead Time",
-    Range = {0, 0.5}, Increment = 0.005, Suffix = "s",
-    CurrentValue = Config.PredictionStrength, Flag = "PredictionStrength",
-    Callback = function(v) Config.PredictionStrength = v end,
-})
-
-PredTab:CreateSlider({
-    Name = "Network Latency Compensation",
-    Range = {0, 0.3}, Increment = 0.005, Suffix = "s",
-    CurrentValue = Config.PredictionLatency, Flag = "PredictionLatency",
-    Callback = function(v) Config.PredictionLatency = v end,
-})
+PredTab:CreateSlider({ Name="Lead Time", Range={0,0.5}, Increment=0.005, Suffix="s",
+    CurrentValue=Config.PredictionStrength, Flag="PredictionStrength",
+    Callback=function(v) Config.PredictionStrength=v end })
+PredTab:CreateSlider({ Name="Latency Compensation", Range={0,0.3}, Increment=0.005, Suffix="s",
+    CurrentValue=Config.PredictionLatency, Flag="PredictionLatency",
+    Callback=function(v) Config.PredictionLatency=v end })
 
 PredTab:CreateSection("Accuracy")
-
-PredTab:CreateSlider({
-    Name = "Max Lead Distance",
-    Range = {1, 30}, Increment = 0.5, Suffix = " studs",
-    CurrentValue = Config.PredictionMaxLead, Flag = "PredictionMaxLead",
-    Callback = function(v) Config.PredictionMaxLead = v end,
-})
-
-PredTab:CreateSlider({
-    Name = "Smoothing Factor (0 = raw, 1 = very smooth)",
-    Range = {0, 1}, Increment = 0.05, Suffix = "",
-    CurrentValue = Config.PredictionSmoothFactor, Flag = "PredictionSmoothFactor",
-    Callback = function(v) Config.PredictionSmoothFactor = v end,
-})
-
-PredTab:CreateToggle({
-    Name = "Adaptive Lead Scaling",
-    CurrentValue = Config.PredictionAdaptive, Flag = "PredictionAdaptive",
-    Callback = function(v) Config.PredictionAdaptive = v end,
-})
-
-PredTab:CreateToggle({
-    Name = "Show Prediction Sphere",
-    CurrentValue = Config.PredictionShowSphere, Flag = "PredictionShowSphere",
-    Callback = function(v)
-        Config.PredictionShowSphere = v
-        if not v then cleanupPredSphere() end
-    end,
-})
+PredTab:CreateSlider({ Name="Max Lead Distance", Range={1,30}, Increment=0.5, Suffix=" studs",
+    CurrentValue=Config.PredictionMaxLead, Flag="PredictionMaxLead",
+    Callback=function(v) Config.PredictionMaxLead=v end })
+PredTab:CreateSlider({ Name="Smoothing (0=raw, 1=smooth)", Range={0,1}, Increment=0.05,
+    CurrentValue=Config.PredictionSmoothFactor, Flag="PredictionSmoothFactor",
+    Callback=function(v) Config.PredictionSmoothFactor=v end })
+PredTab:CreateToggle({ Name="Adaptive Lead Scaling", CurrentValue=Config.PredictionAdaptive, Flag="PredictionAdaptive",
+    Callback=function(v) Config.PredictionAdaptive=v end })
+PredTab:CreateToggle({ Name="Show Prediction Sphere", CurrentValue=Config.PredictionShowSphere, Flag="PredictionShowSphere",
+    Callback=function(v) Config.PredictionShowSphere=v if not v then cleanupPredSphere() end end })
 
 PredTab:CreateSection("HvH Presets")
+PredTab:CreateButton({ Name="Slingshot HvH (Recommended)", Callback=function()
+    Config.PredictionMethod="Velocity + Accel" Config.PredictionStrength=0.09
+    Config.PredictionLatency=0.055 Config.PredictionMaxLead=6
+    Config.PredictionSmoothFactor=0.45 Config.PredictionAdaptive=true predCache={}
+    Rayfield:Notify({ Title="Slingshot HvH", Content="Preset applied", Duration=3 })
+end })
+PredTab:CreateButton({ Name="Bow Long Range", Callback=function()
+    Config.PredictionMethod="Velocity + Accel" Config.PredictionStrength=0.18
+    Config.PredictionLatency=0.07 Config.PredictionMaxLead=12
+    Config.PredictionSmoothFactor=0.55 Config.PredictionAdaptive=true predCache={}
+    Rayfield:Notify({ Title="Bow Long Range", Content="Preset applied", Duration=3 })
+end })
+PredTab:CreateButton({ Name="Daggers (Fast Targets)", Callback=function()
+    Config.PredictionMethod="Kalman" Config.PredictionStrength=0.06
+    Config.PredictionLatency=0.04 Config.PredictionMaxLead=5
+    Config.PredictionSmoothFactor=0.35 Config.PredictionAdaptive=true predCache={}
+    Rayfield:Notify({ Title="Daggers", Content="Preset applied", Duration=3 })
+end })
+PredTab:CreateButton({ Name="High Ping (100ms+)", Callback=function()
+    Config.PredictionMethod="Velocity + Accel" Config.PredictionStrength=0.12
+    Config.PredictionLatency=0.12 Config.PredictionMaxLead=10
+    Config.PredictionSmoothFactor=0.5 Config.PredictionAdaptive=true predCache={}
+    Rayfield:Notify({ Title="High Ping", Content="Preset applied", Duration=3 })
+end })
+PredTab:CreateButton({ Name="Reset Cache", Callback=function()
+    predCache={}
+    Rayfield:Notify({ Title="Cache Cleared", Content="Prediction history reset", Duration=3 })
+end })
 
-PredTab:CreateButton({
-    Name = "Slingshot HvH (Recommended)",
-    Callback = function()
-        Config.PredictionMethod       = "Velocity + Accel"
-        Config.PredictionStrength     = 0.09
-        Config.PredictionLatency      = 0.055
-        Config.PredictionMaxLead      = 6
-        Config.PredictionSmoothFactor = 0.45
-        Config.PredictionAdaptive     = true
-        predCache = {}
-        Rayfield:Notify({
-            Title   = "Slingshot HvH Preset",
-            Content = "Optimised for slingshot close range",
-            Duration = 4,
-        })
-    end,
-})
-
-PredTab:CreateButton({
-    Name = "Bow Long Range",
-    Callback = function()
-        Config.PredictionMethod       = "Velocity + Accel"
-        Config.PredictionStrength     = 0.18
-        Config.PredictionLatency      = 0.07
-        Config.PredictionMaxLead      = 12
-        Config.PredictionSmoothFactor = 0.55
-        Config.PredictionAdaptive     = true
-        predCache = {}
-        Rayfield:Notify({
-            Title   = "Bow Long Range Preset",
-            Content = "Higher lead for long distance shots",
-            Duration = 4,
-        })
-    end,
-})
-
-PredTab:CreateButton({
-    Name = "Daggers (Fast Targets)",
-    Callback = function()
-        Config.PredictionMethod       = "Kalman"
-        Config.PredictionStrength     = 0.06
-        Config.PredictionLatency      = 0.04
-        Config.PredictionMaxLead      = 5
-        Config.PredictionSmoothFactor = 0.35
-        Config.PredictionAdaptive     = true
-        predCache = {}
-        Rayfield:Notify({
-            Title   = "Daggers Preset",
-            Content = "Kalman method for fast/unpredictable targets",
-            Duration = 4,
-        })
-    end,
-})
-
-PredTab:CreateButton({
-    Name = "High Ping (100ms+)",
-    Callback = function()
-        Config.PredictionMethod       = "Velocity + Accel"
-        Config.PredictionStrength     = 0.12
-        Config.PredictionLatency      = 0.12
-        Config.PredictionMaxLead      = 10
-        Config.PredictionSmoothFactor = 0.5
-        Config.PredictionAdaptive     = true
-        predCache = {}
-        Rayfield:Notify({
-            Title   = "High Ping Preset",
-            Content = "Extra latency comp for laggy servers",
-            Duration = 4,
-        })
-    end,
-})
-
-PredTab:CreateButton({
-    Name = "Reset Prediction Cache",
-    Callback = function()
-        predCache = {}
-        Rayfield:Notify({ Title = "Cache Cleared", Content = "Prediction history reset", Duration = 3 })
-    end,
-})
-
-PredTab:CreateSection("Method Info")
-PredTab:CreateLabel("Velocity Only    → Simple, low CPU, less accurate")
-PredTab:CreateLabel("Velocity + Accel → Best for most slingshot/bow HvH")
-PredTab:CreateLabel("Kalman           → Best for erratic/strafing targets")
-PredTab:CreateLabel("")
-PredTab:CreateLabel("Lead Time    = how far ahead to aim")
-PredTab:CreateLabel("Latency Comp = adds your ping on top of lead")
-PredTab:CreateLabel("Adaptive     = auto scales lead by target speed")
-PredTab:CreateLabel("Smoothing    = reduces jitter (higher = smoother)")
-PredTab:CreateLabel("Max Lead     = caps the stud overshoot distance")
+PredTab:CreateSection("Info")
+PredTab:CreateLabel("Velocity Only    → Simple, lightest on CPU")
+PredTab:CreateLabel("Velocity + Accel → Best for slingshot HvH")
+PredTab:CreateLabel("Kalman           → Best for strafing targets")
+PredTab:CreateLabel("Cache updates every N frames to save FPS")
 
 -- ═══════════════════════════════════════════
--- AVATAR CHANGER TAB
+-- AVATAR TAB
 -- ═══════════════════════════════════════════
 local AvatarTab = Window:CreateTab("Avatar", "user")
 
 AvatarTab:CreateSection("Victim Settings")
-
-AvatarTab:CreateInput({
-    Name = "Victim User ID", PlaceholderText = "Enter Roblox User ID (numbers only)...",
-    RemoveTextAfterFocusLost = false, Flag = "AvatarVictimId",
-    Callback = function(v)
-        local id = tonumber(v)
-        if id then
-            Config.AvatarVictimId = id
-            Rayfield:Notify({ Title = "Victim ID Set", Content = "User ID: " .. id, Duration = 3 })
-        else
-            Rayfield:Notify({ Title = "Invalid ID", Content = "Numbers only", Duration = 3 })
-        end
-    end,
-})
-
-AvatarTab:CreateInput({
-    Name = "Helper Username (optional)", PlaceholderText = "Leave empty to spoof yourself...",
-    RemoveTextAfterFocusLost = false, Flag = "AvatarHelper",
-    Callback = function(v) Config.AvatarHelper = v end,
-})
+AvatarTab:CreateInput({ Name="Victim User ID", PlaceholderText="Roblox User ID (numbers only)...",
+    RemoveTextAfterFocusLost=false, Flag="AvatarVictimId",
+    Callback=function(v) local id=tonumber(v) if id then Config.AvatarVictimId=id
+        Rayfield:Notify({ Title="ID Set", Content="User ID: "..id, Duration=3 })
+    else Rayfield:Notify({ Title="Invalid", Content="Numbers only", Duration=3 }) end end })
+AvatarTab:CreateInput({ Name="Helper Username (optional)", PlaceholderText="Leave empty to spoof yourself...",
+    RemoveTextAfterFocusLost=false, Flag="AvatarHelper",
+    Callback=function(v) Config.AvatarHelper=v end })
 
 AvatarTab:CreateSection("Stat Overrides")
-
-AvatarTab:CreateSlider({
-    Name = "Level Override", Range = {1,1000}, Increment = 1, Suffix = " lvl",
-    CurrentValue = Config.AvatarLevel, Flag = "AvatarLevel",
-    Callback = function(v) Config.AvatarLevel = v end,
-})
-
-AvatarTab:CreateSlider({
-    Name = "Win Streak Override", Range = {0,500}, Increment = 1, Suffix = " wins",
-    CurrentValue = Config.AvatarStreak, Flag = "AvatarStreak",
-    Callback = function(v) Config.AvatarStreak = v end,
-})
-
-AvatarTab:CreateSlider({
-    Name = "ELO Override (0 = disabled)", Range = {0,10000}, Increment = 10, Suffix = " elo",
-    CurrentValue = Config.AvatarElo, Flag = "AvatarElo",
-    Callback = function(v) Config.AvatarElo = v end,
-})
-
-AvatarTab:CreateSlider({
-    Name = "Keys Override (0 = disabled)", Range = {0,9999}, Increment = 1, Suffix = " keys",
-    CurrentValue = Config.AvatarKeys, Flag = "AvatarKeys",
-    Callback = function(v) Config.AvatarKeys = v end,
-})
+AvatarTab:CreateSlider({ Name="Level",      Range={1,1000},  Increment=1,  Suffix=" lvl",  CurrentValue=Config.AvatarLevel,  Flag="AvatarLevel",  Callback=function(v) Config.AvatarLevel=v end })
+AvatarTab:CreateSlider({ Name="Win Streak", Range={0,500},   Increment=1,  Suffix=" wins", CurrentValue=Config.AvatarStreak, Flag="AvatarStreak", Callback=function(v) Config.AvatarStreak=v end })
+AvatarTab:CreateSlider({ Name="ELO (0=off)",Range={0,10000}, Increment=10, Suffix=" elo",  CurrentValue=Config.AvatarElo,    Flag="AvatarElo",    Callback=function(v) Config.AvatarElo=v end })
+AvatarTab:CreateSlider({ Name="Keys (0=off)",Range={0,9999}, Increment=1,  Suffix=" keys", CurrentValue=Config.AvatarKeys,   Flag="AvatarKeys",   Callback=function(v) Config.AvatarKeys=v end })
 
 AvatarTab:CreateSection("Badges & Status")
-
-AvatarTab:CreateToggle({
-    Name = "Spoof Premium", CurrentValue = Config.AvatarPremium, Flag = "AvatarPremium",
-    Callback = function(v) Config.AvatarPremium = v end,
-})
-
-AvatarTab:CreateToggle({
-    Name = "Spoof Verified Badge", CurrentValue = Config.AvatarVerified, Flag = "AvatarVerified",
-    Callback = function(v) Config.AvatarVerified = v end,
-})
-
-AvatarTab:CreateToggle({
-    Name = "Unlock All", CurrentValue = Config.AvatarUnlockAll, Flag = "AvatarUnlockAll",
-    Callback = function(v) Config.AvatarUnlockAll = v end,
-})
+AvatarTab:CreateToggle({ Name="Spoof Premium",        CurrentValue=Config.AvatarPremium,   Flag="AvatarPremium",   Callback=function(v) Config.AvatarPremium=v end })
+AvatarTab:CreateToggle({ Name="Spoof Verified Badge",  CurrentValue=Config.AvatarVerified,  Flag="AvatarVerified",  Callback=function(v) Config.AvatarVerified=v end })
+AvatarTab:CreateToggle({ Name="Unlock All",            CurrentValue=Config.AvatarUnlockAll, Flag="AvatarUnlockAll", Callback=function(v) Config.AvatarUnlockAll=v end })
 
 AvatarTab:CreateSection("Platform")
-
-AvatarTab:CreateDropdown({
-    Name = "Platform", Options = {"DESKTOP","MOBILE","CONSOLE","VR"},
-    CurrentOption = Config.AvatarPlatform, Flag = "AvatarPlatform",
-    Callback = function(v)
-        Config.AvatarPlatform = v
-        Rayfield:Notify({ Title = "Platform Set", Content = "Platform → " .. v, Duration = 3 })
-    end,
-})
+AvatarTab:CreateDropdown({ Name="Platform", Options={"DESKTOP","MOBILE","CONSOLE","VR"},
+    CurrentOption=Config.AvatarPlatform, Flag="AvatarPlatform",
+    Callback=function(v) Config.AvatarPlatform=v end })
 
 AvatarTab:CreateSection("Control")
-
-AvatarTab:CreateButton({
-    Name = "▶  Apply Avatar Changer",
-    Callback = function() startAvatarChanger() end,
-})
-
-AvatarTab:CreateButton({
-    Name = "■  Stop Avatar Changer",
-    Callback = function() stopAvatarChanger() end,
-})
-
-AvatarTab:CreateSection("Quick Lookup")
-
-AvatarTab:CreateButton({
-    Name = "Preview Victim Info",
-    Callback = function()
-        if Config.AvatarVictimId == 0 then
-            Rayfield:Notify({ Title = "No ID", Content = "Enter a victim User ID first", Duration = 3 })
-            return
-        end
-        pcall(function()
-            local raw     = game:HttpGet("https://users.roblox.com/v1/users/" .. Config.AvatarVictimId, true)
-            local decoded = HttpService:JSONDecode(raw)
-            Rayfield:Notify({
-                Title   = "Victim Found",
-                Content = "Name: " .. decoded.name .. "\nDisplay: " .. decoded.displayName .. "\nID: " .. decoded.id,
-                Duration = 6,
-            })
-        end)
-    end,
-})
-
-AvatarTab:CreateSection("Info")
-AvatarTab:CreateLabel("Enter a Roblox User ID to spoof that avatar")
-AvatarTab:CreateLabel("Leave helper empty to spoof yourself")
-AvatarTab:CreateLabel("Premium/Verified uses hookmetamethod")
-AvatarTab:CreateLabel("Rejoin to fully revert avatar changes")
+AvatarTab:CreateButton({ Name="▶  Apply Avatar Changer", Callback=function() startAvatarChanger() end })
+AvatarTab:CreateButton({ Name="■  Stop Avatar Changer",  Callback=function() stopAvatarChanger()  end })
+AvatarTab:CreateButton({ Name="Preview Victim Info", Callback=function()
+    if Config.AvatarVictimId==0 then
+        Rayfield:Notify({ Title="No ID", Content="Enter ID first", Duration=3 }) return end
+    pcall(function()
+        local raw=game:HttpGet("https://users.roblox.com/v1/users/"..Config.AvatarVictimId,true)
+        local d=HttpService:JSONDecode(raw)
+        Rayfield:Notify({ Title="Victim", Content="Name: "..d.name.."\nDisplay: "..d.displayName.."\nID: "..d.id, Duration=6 })
+    end)
+end })
 
 -- ═══════════════════════════════════════════
 -- TARGETS TAB
@@ -1046,68 +886,37 @@ AvatarTab:CreateLabel("Rejoin to fully revert avatar changes")
 local TargetsTab = Window:CreateTab("Targets", "users")
 
 TargetsTab:CreateSection("Target Selection")
-
-TargetsTab:CreateDropdown({
-    Name = "Target Mode", Options = {"All Enemies","Nearest Enemy","Specific Player"},
-    CurrentOption = Config.TargetMode, Flag = "TargetMode",
-    Callback = function(v)
-        Config.TargetMode = v
-        if v == "Specific Player" then
-            Rayfield:Notify({ Title = "Specific Player", Content = "Enter username below", Duration = 4 })
-        end
-    end,
-})
-
-TargetsTab:CreateInput({
-    Name = "Specific Player Username", PlaceholderText = "Enter exact username...",
-    RemoveTextAfterFocusLost = false, Flag = "TargetUsername",
-    Callback = function(v)
-        Config.TargetPlayer = v
-        targetPlayerObj     = nil
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p.Name:lower() == v:lower() or p.DisplayName:lower() == v:lower() then
-                targetPlayerObj = p
-                Rayfield:Notify({ Title = "Target Found", Content = "Targeting: " .. p.Name, Duration = 3 })
-                return
+TargetsTab:CreateDropdown({ Name="Target Mode", Options={"All Enemies","Nearest Enemy","Specific Player"},
+    CurrentOption=Config.TargetMode, Flag="TargetMode",
+    Callback=function(v) Config.TargetMode=v nearestEnemyCache=nil end })
+TargetsTab:CreateInput({ Name="Specific Player Username", PlaceholderText="Exact username...",
+    RemoveTextAfterFocusLost=false, Flag="TargetUsername",
+    Callback=function(v)
+        Config.TargetPlayer=v targetPlayerObj=nil
+        for _,p in ipairs(Players:GetPlayers()) do
+            if p.Name:lower()==v:lower() or p.DisplayName:lower()==v:lower() then
+                targetPlayerObj=p
+                Rayfield:Notify({ Title="Target Found", Content="Targeting: "..p.Name, Duration=3 }) return
             end
         end
-        if v ~= "" then
-            Rayfield:Notify({ Title = "Not Found", Content = "'" .. v .. "' not in server", Duration = 3 })
-        end
-    end,
-})
-
+        if v~="" then Rayfield:Notify({ Title="Not Found", Content="'"..v.."' not in server", Duration=3 }) end
+    end })
 TargetsTab:CreateSection("Player List")
-
-TargetsTab:CreateButton({
-    Name = "Refresh Player List",
-    Callback = function()
-        local names = {}
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer then table.insert(names, p.Name) end
-        end
-        Rayfield:Notify({
-            Title   = "Players in Server",
-            Content = #names > 0 and table.concat(names, ", ") or "No other players",
-            Duration = 5,
-        })
-    end,
-})
-
-TargetsTab:CreateButton({
-    Name = "Select Nearest Enemy",
-    Callback = function()
-        local nearest = getNearestEnemy()
-        if nearest then
-            Config.TargetMode   = "Specific Player"
-            Config.TargetPlayer = nearest.Name
-            targetPlayerObj     = nearest
-            Rayfield:Notify({ Title = "Target Set", Content = "Targeting: " .. nearest.Name, Duration = 3 })
-        else
-            Rayfield:Notify({ Title = "No Enemies", Content = "No other players found", Duration = 3 })
-        end
-    end,
-})
+TargetsTab:CreateButton({ Name="Refresh Player List", Callback=function()
+    local names={}
+    for _,p in ipairs(Players:GetPlayers()) do if p~=LocalPlayer then table.insert(names,p.Name) end end
+    Rayfield:Notify({ Title="Players", Content=#names>0 and table.concat(names,", ") or "None", Duration=5 })
+end })
+TargetsTab:CreateButton({ Name="Select Nearest Enemy", Callback=function()
+    nearestEnemyCacheTime=0
+    local n=getNearestEnemy()
+    if n then
+        Config.TargetMode=n.Name targetPlayerObj=n
+        Rayfield:Notify({ Title="Target Set", Content="Targeting: "..n.Name, Duration=3 })
+    else
+        Rayfield:Notify({ Title="No Enemies", Content="No players found", Duration=3 })
+    end
+end })
 
 -- ═══════════════════════════════════════════
 -- CONFIG TAB
@@ -1115,137 +924,83 @@ TargetsTab:CreateButton({
 local ConfigTab = Window:CreateTab("Config", "save")
 
 ConfigTab:CreateSection("Save & Load")
-ConfigTab:CreateLabel("Config saves to: unnamed/rivals_config.json")
-
-ConfigTab:CreateButton({
-    Name = "Save Config",
-    Callback = function()
-        saveConfig()
-        Rayfield:Notify({ Title = "Saved", Content = "unnamed/rivals_config.json", Duration = 3 })
-    end,
-})
-
-ConfigTab:CreateButton({
-    Name = "Load Config",
-    Callback = function()
-        loadConfig()
-        if Config.Enabled then startBypass() else stopBypass() end
-        if Config.WeaponSpeedEnabled then applyWeaponSpeed(Config.WeaponSpeedPercent) end
-        Rayfield:Notify({ Title = "Loaded", Content = "Settings loaded from file", Duration = 3 })
-    end,
-})
-
-ConfigTab:CreateButton({
-    Name = "Reset to Default",
-    Callback = function()
-        Config.Enabled              = false
-        Config.TeleportEnemies      = true
-        Config.TeleportProj         = true
-        Config.TeleportFastParts    = true
-        Config.VoidPos              = Vector3.new(9000,9000,9000)
-        Config.TargetMode           = "All Enemies"
-        Config.TargetPlayer         = ""
-        Config.SpeedThreshold       = 50
-        Config.WeaponSpeedEnabled   = false
-        Config.WeaponSpeedPercent   = 100
-        Config.PredictionEnabled    = false
-        Config.PredictionMethod     = "Velocity + Accel"
-        Config.PredictionStrength   = 0.1
-        Config.PredictionMaxLead    = 8
-        Config.PredictionShowSphere = false
-        Config.PredictionLatency    = 0.065
-        Config.PredictionSmoothFactor = 0.6
-        Config.PredictionAdaptive   = true
-        Config.AvatarVictimId       = 0
-        Config.AvatarHelper         = ""
-        Config.AvatarLevel          = 1
-        Config.AvatarStreak         = 0
-        Config.AvatarElo            = 0
-        Config.AvatarKeys           = 0
-        Config.AvatarPremium        = false
-        Config.AvatarVerified       = false
-        Config.AvatarUnlockAll      = false
-        Config.AvatarPlatform       = "DESKTOP"
-        stopBypass()
-        resetWeaponSpeed()
-        cleanupPredSphere()
-        predCache = {}
-        if avatarActive then stopAvatarChanger() end
-        saveConfig()
-        Rayfield:Notify({ Title = "Reset Done", Content = "All settings reset to default", Duration = 3 })
-    end,
-})
-
+ConfigTab:CreateLabel("Saves to: unnamed/rivals_config.json")
+ConfigTab:CreateButton({ Name="Save Config",   Callback=function() saveConfig() Rayfield:Notify({ Title="Saved", Content="Config saved", Duration=3 }) end })
+ConfigTab:CreateButton({ Name="Load Config",   Callback=function()
+    loadConfig()
+    if Config.Enabled then startBypass() else stopBypass() end
+    if Config.WeaponSpeedEnabled then applyWeaponSpeed(Config.WeaponSpeedPercent) end
+    Rayfield:Notify({ Title="Loaded", Content="Config loaded", Duration=3 })
+end })
+ConfigTab:CreateButton({ Name="Reset to Default", Callback=function()
+    Config.Enabled=false Config.TeleportEnemies=true Config.TeleportProj=true
+    Config.TeleportFastParts=true Config.VoidPos=Vector3.new(9000,9000,9000)
+    Config.TargetMode="All Enemies" Config.TargetPlayer="" Config.SpeedThreshold=50
+    Config.WeaponSpeedEnabled=false Config.WeaponSpeedPercent=100
+    Config.PredictionEnabled=false Config.PredictionMethod="Velocity + Accel"
+    Config.PredictionStrength=0.09 Config.PredictionMaxLead=6
+    Config.PredictionShowSphere=false Config.PredictionLatency=0.055
+    Config.PredictionSmoothFactor=0.45 Config.PredictionAdaptive=true
+    Config.AvatarVictimId=0 Config.AvatarHelper="" Config.AvatarLevel=1
+    Config.AvatarStreak=0 Config.AvatarElo=0 Config.AvatarKeys=0
+    Config.AvatarPremium=false Config.AvatarVerified=false
+    Config.AvatarUnlockAll=false Config.AvatarPlatform="DESKTOP"
+    stopBypass() resetWeaponSpeed() cleanupPredSphere() predCache={}
+    if avatarActive then stopAvatarChanger() end
+    saveConfig()
+    Rayfield:Notify({ Title="Reset", Content="All defaults restored", Duration=3 })
+end })
 ConfigTab:CreateSection("Auto Save")
-
-ConfigTab:CreateToggle({
-    Name = "Auto Save (every 10s)", CurrentValue = false, Flag = "AutoSave",
-    Callback = function(v)
-        if v then
-            task.spawn(function()
-                while true do
-                    task.wait(10)
-                    local flags = Rayfield.Flags
-                    if flags and flags["AutoSave"] and flags["AutoSave"].Value then
-                        saveConfig()
-                    else break end
-                end
-            end)
-        end
-        Rayfield:Notify({
-            Title   = v and "Auto Save ON" or "Auto Save OFF",
-            Content = v and "Saves every 10 seconds" or "Save manually",
-            Duration = 3,
-        })
-    end,
-})
+ConfigTab:CreateToggle({ Name="Auto Save (every 10s)", CurrentValue=false, Flag="AutoSave",
+    Callback=function(v)
+        if v then task.spawn(function()
+            while true do task.wait(10)
+                local f=Rayfield.Flags
+                if f and f["AutoSave"] and f["AutoSave"].Value then saveConfig() else break end
+            end
+        end) end
+        Rayfield:Notify({ Title=v and "Auto Save ON" or "Auto Save OFF",
+            Content=v and "Every 10s" or "Manual only", Duration=3 })
+    end })
 
 -- ═══════════════════════════════════════════
 -- INFO TAB
 -- ═══════════════════════════════════════════
 local InfoTab = Window:CreateTab("Info", "info")
-
-InfoTab:CreateSection("System Info")
-InfoTab:CreateLabel("yux/overkill paid bypass")
-InfoTab:CreateLabel("Bypass · Speed · Prediction · Avatar")
+InfoTab:CreateSection("Performance Notes")
+InfoTab:CreateLabel("Prediction updates every N frames (not every frame)")
+InfoTab:CreateLabel("Nearest enemy cached for 0.12s between recalcs")
+InfoTab:CreateLabel("Avatar RenderStepped skips every 6 frames")
+InfoTab:CreateLabel("Player list cached on join/leave events")
+InfoTab:CreateLabel("Squared distance used (no sqrt cost)")
+InfoTab:CreateLabel("No workspace:GetChildren() in heartbeat loop")
 
 InfoTab:CreateSection("Emergency")
-
-InfoTab:CreateButton({
-    Name = "Force Stop Everything",
-    Callback = function()
-        Config.Enabled            = false
-        Config.WeaponSpeedEnabled = false
-        Config.PredictionEnabled  = false
-        stopBypass()
-        resetWeaponSpeed()
-        cleanupPredSphere()
-        predCache = {}
-        if avatarActive then stopAvatarChanger() end
-        Rayfield:Notify({ Title = "Force Stopped", Content = "All systems disabled", Duration = 3 })
-    end,
-})
+InfoTab:CreateButton({ Name="Force Stop Everything", Callback=function()
+    Config.Enabled=false Config.WeaponSpeedEnabled=false Config.PredictionEnabled=false
+    stopBypass() resetWeaponSpeed() cleanupPredSphere() predCache={}
+    if avatarActive then stopAvatarChanger() end
+    Rayfield:Notify({ Title="Stopped", Content="All systems off", Duration=3 })
+end })
 
 -- ═══════════════════════════════════════════
 -- INIT
 -- ═══════════════════════════════════════════
 Rayfield:Notify({
     Title   = "yux/overkill loaded",
-    Content = "Config auto-loaded · Use Slingshot HvH preset for best results",
-    Duration = 6,
+    Content = "Optimised build · Low-end friendly",
+    Duration = 5,
 })
 
 if Config.Enabled then startBypass() end
 if Config.WeaponSpeedEnabled then applyWeaponSpeed(Config.WeaponSpeedPercent) end
 
 LocalPlayer.CharacterAdded:Connect(function()
-    trackedParts = {}
-    predCache    = {}
+    trackedParts          = {}
+    predCache             = {}
+    nearestEnemyCache     = nil
+    nearestEnemyCacheTime = 0
     cleanupPredSphere()
     if Config.Enabled then task.wait(1) startBypass() end
     if Config.WeaponSpeedEnabled then task.wait(1) applyWeaponSpeed(Config.WeaponSpeedPercent) end
-end)
-
-Players.PlayerRemoving:Connect(function(p)
-    predCache[p] = nil
 end)
