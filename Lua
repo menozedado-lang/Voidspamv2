@@ -8,30 +8,112 @@ local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 -- ═══════════════════════════════════════════
 -- SERVICES
 -- ═══════════════════════════════════════════
-local RunService  = game:GetService("RunService")
-local Players     = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
+local RunService         = game:GetService("RunService")
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local LocalPlayer        = Players.LocalPlayer
 
 -- ═══════════════════════════════════════════
 -- STATE
 -- ═══════════════════════════════════════════
 local Config = {
-    Enabled          = false,
-    TeleportEnemies  = true,
-    TeleportProj     = true,
-    TeleportFastParts= true,
-    VoidPos          = Vector3.new(9000, 9000, 9000),
-    WhitelistSelf    = true,
-    TargetMode       = "All Enemies",
-    TargetPlayer     = "",
-    SpeedThreshold   = 50,
+    Enabled           = false,
+    TeleportEnemies   = true,
+    TeleportProj      = true,
+    TeleportFastParts = true,
+    VoidPos           = Vector3.new(9000, 9000, 9000),
+    WhitelistSelf     = true,
+    TargetMode        = "All Enemies",
+    TargetPlayer      = "",
+    SpeedThreshold    = 50,
+
+    -- Weapon Speed
+    WeaponSpeedEnabled = false,
+    WeaponSpeedPercent = 100, -- 100% = normal, 0% = slowest, 300% = fastest
 }
 
-local trackedParts = {}
-local heartbeatConn = nil
-local childAddedConn = nil
-local childRemovedConn = nil
-local targetPlayerObj = nil
+local trackedParts      = {}
+local heartbeatConn     = nil
+local childAddedConn    = nil
+local childRemovedConn  = nil
+local targetPlayerObj   = nil
+
+-- ═══════════════════════════════════════════
+-- WEAPON SPEED
+-- ═══════════════════════════════════════════
+
+-- Default reload lengths per weapon (100% baseline)
+local DefaultReloadLengths = {
+    Bow       = 0,
+    Daggers   = 0.09,
+    Slingshot = 0,
+}
+
+local WhitelistedItems = {"Bow", "Daggers", "Slingshot"}
+
+local function applyWeaponSpeed(percent)
+    local ok, err = pcall(function()
+        local ItemLibrary = require(ReplicatedStorage.Modules.ItemLibrary)
+        local Items       = rawget(ItemLibrary, "Items")
+        if not Items then
+            Rayfield:Notify({
+                Title    = "Weapon Speed",
+                Content  = "Could not find ItemLibrary.Items",
+                Duration = 4,
+            })
+            return
+        end
+
+        -- percent: 0 = slowest (longest reload), 300 = fastest (shortest reload)
+        -- At 100%  → default reload length
+        -- At 0%    → 3x the default reload (300% slower)
+        -- At 300%  → 0 reload (instant)
+        local multiplier = (300 - percent) / 200  -- maps 0%→1.5x, 100%→1x, 300%→0x
+
+        for _, Item in Items do
+            local Name = Item.Name
+            if not table.find(WhitelistedItems, Name) then continue end
+            if Item["ReloadLength"] == nil then continue end
+
+            local base    = DefaultReloadLengths[Name] or 0
+            local newVal  = math.clamp(base * multiplier, 0, base * 3)
+
+            -- At 300% just force 0 / near-instant
+            if percent >= 300 then
+                newVal = (Name == "Daggers") and 0.001 or 0
+            end
+
+            rawset(Item, "ReloadLength", newVal)
+        end
+    end)
+
+    if not ok then
+        Rayfield:Notify({
+            Title    = "Weapon Speed Error",
+            Content  = tostring(err),
+            Duration = 5,
+        })
+    end
+end
+
+local function resetWeaponSpeed()
+    local ok, err = pcall(function()
+        local ItemLibrary = require(ReplicatedStorage.Modules.ItemLibrary)
+        local Items       = rawget(ItemLibrary, "Items")
+        if not Items then return end
+
+        for _, Item in Items do
+            local Name = Item.Name
+            if not table.find(WhitelistedItems, Name) then continue end
+            if Item["ReloadLength"] == nil then continue end
+            rawset(Item, "ReloadLength", DefaultReloadLengths[Name] or 0)
+        end
+    end)
+
+    if not ok then
+        warn("resetWeaponSpeed error: " .. tostring(err))
+    end
+end
 
 -- ═══════════════════════════════════════════
 -- CORE BYPASS FUNCTIONS
@@ -47,7 +129,6 @@ local function shouldTargetPlayer(p)
     elseif Config.TargetMode == "Specific Player" then
         return targetPlayerObj ~= nil and p == targetPlayerObj
     elseif Config.TargetMode == "Nearest Enemy" then
-        -- handled separately
         return true
     end
     return true
@@ -57,7 +138,7 @@ local function getNearestEnemy()
     local myChar = LocalPlayer.Character
     local myHRP  = myChar and myChar:FindFirstChild("HumanoidRootPart")
     if not myHRP then return nil end
-    local nearest = nil
+    local nearest     = nil
     local nearestDist = math.huge
     for _, p in ipairs(Players:GetPlayers()) do
         if p == LocalPlayer then continue end
@@ -67,7 +148,7 @@ local function getNearestEnemy()
             local d = (hrp.Position - myHRP.Position).Magnitude
             if d < nearestDist then
                 nearestDist = d
-                nearest = p
+                nearest     = p
             end
         end
     end
@@ -78,8 +159,8 @@ end
 -- START / STOP
 -- ═══════════════════════════════════════════
 local function stopBypass()
-    if heartbeatConn   then heartbeatConn:Disconnect();   heartbeatConn   = nil end
-    if childAddedConn  then childAddedConn:Disconnect();  childAddedConn  = nil end
+    if heartbeatConn    then heartbeatConn:Disconnect();    heartbeatConn    = nil end
+    if childAddedConn   then childAddedConn:Disconnect();   childAddedConn   = nil end
     if childRemovedConn then childRemovedConn:Disconnect(); childRemovedConn = nil end
     trackedParts = {}
 end
@@ -87,7 +168,6 @@ end
 local function startBypass()
     stopBypass()
 
-    -- Track projectiles added to workspace
     childAddedConn = workspace.ChildAdded:Connect(function(o)
         if not o:IsA("BasePart") then return end
         if o.Name == "CoreProjectile" then
@@ -114,7 +194,7 @@ local function startBypass()
                 local nearestOnly = Config.TargetMode == "Nearest Enemy" and getNearestEnemy() or nil
 
                 for _, p in ipairs(Players:GetPlayers()) do
-                    if p == LocalPlayer then continue end
+                    if not shouldTargetPlayer(p) then continue end
 
                     local skip = false
                     if Config.TargetMode == "Nearest Enemy" then
@@ -134,24 +214,19 @@ local function startBypass()
                 end
             end
 
-            -- ── Teleport CoreProjectile ──
-            if Config.TeleportProj then
-                for _, o in ipairs(workspace:GetChildren()) do
-                    if o.Name == "CoreProjectile" and o:IsA("BasePart") then
-                        o.CFrame                 = voidCF
-                        o.AssemblyLinearVelocity = Vector3.zero
-                    end
-                end
-            end
+            -- ── Teleport tracked parts (CoreProjectile + fast parts) ──
+            if Config.TeleportProj or Config.TeleportFastParts then
+                for part, _ in pairs(trackedParts) do
+                    if part and part.Parent then
+                        local isProj  = part.Name == "CoreProjectile"
+                        local isFast  = not isProj
 
-            -- ── Teleport tracked fast parts ──
-            if Config.TeleportFastParts then
-                for p, _ in pairs(trackedParts) do
-                    if p and p.Parent then
-                        p.CFrame                 = voidCF
-                        p.AssemblyLinearVelocity = Vector3.zero
+                        if (isProj and Config.TeleportProj) or (isFast and Config.TeleportFastParts) then
+                            part.CFrame                 = voidCF
+                            part.AssemblyLinearVelocity = Vector3.zero
+                        end
                     else
-                        trackedParts[p] = nil
+                        trackedParts[part] = nil
                     end
                 end
             end
@@ -163,9 +238,9 @@ end
 -- RAYFIELD UI
 -- ═══════════════════════════════════════════
 local Window = Rayfield:CreateWindow({
-    Name             = "Rivals Projectile Bypass",
-    LoadingTitle     = "Rivals Bypass",
-    LoadingSubtitle  = "Slingshot · Dagger · Bow",
+    Name            = "Rivals Projectile Bypass",
+    LoadingTitle    = "Rivals Bypass",
+    LoadingSubtitle = "Slingshot · Dagger · Bow",
     ConfigurationSaving = {
         Enabled    = true,
         FolderName = "RivalsProjectileBypass",
@@ -190,15 +265,15 @@ MainTab:CreateToggle({
         if v then
             startBypass()
             Rayfield:Notify({
-                Title   = "Bypass Active",
-                Content = "Projectile bypass enabled",
+                Title    = "Bypass Active",
+                Content  = "Projectile bypass enabled",
                 Duration = 3,
             })
         else
             stopBypass()
             Rayfield:Notify({
-                Title   = "Bypass Stopped",
-                Content = "Projectile bypass disabled",
+                Title    = "Bypass Stopped",
+                Content  = "Projectile bypass disabled",
                 Duration = 3,
             })
         end
@@ -285,6 +360,106 @@ MainTab:CreateSlider({
 })
 
 -- ═══════════════════════════════════════════
+-- WEAPON SPEED TAB
+-- ═══════════════════════════════════════════
+local SpeedTab = Window:CreateTab("Weapon Speed", "zap")
+
+SpeedTab:CreateSection("Bow · Daggers · Slingshot")
+
+SpeedTab:CreateToggle({
+    Name         = "Enable Weapon Speed",
+    CurrentValue = false,
+    Flag         = "WeaponSpeedEnabled",
+    Callback     = function(v)
+        Config.WeaponSpeedEnabled = v
+        if v then
+            applyWeaponSpeed(Config.WeaponSpeedPercent)
+            Rayfield:Notify({
+                Title    = "Weapon Speed ON",
+                Content  = "Speed set to " .. Config.WeaponSpeedPercent .. "%",
+                Duration = 3,
+            })
+        else
+            resetWeaponSpeed()
+            Rayfield:Notify({
+                Title    = "Weapon Speed OFF",
+                Content  = "Reload lengths reset to default",
+                Duration = 3,
+            })
+        end
+    end,
+})
+
+SpeedTab:CreateSlider({
+    Name         = "Weapon Speed %",
+    Range        = {0, 300},
+    Increment    = 1,
+    Suffix       = "%",
+    CurrentValue = 100,
+    Flag         = "WeaponSpeedPercent",
+    Callback     = function(v)
+        Config.WeaponSpeedPercent = v
+        if Config.WeaponSpeedEnabled then
+            applyWeaponSpeed(v)
+        end
+    end,
+})
+
+SpeedTab:CreateSection("Presets")
+
+SpeedTab:CreateButton({
+    Name     = "Normal Speed (100%)",
+    Callback = function()
+        Config.WeaponSpeedPercent = 100
+        if Config.WeaponSpeedEnabled then
+            applyWeaponSpeed(100)
+        end
+        Rayfield:Notify({
+            Title    = "Preset Applied",
+            Content  = "Weapon speed set to 100% (default)",
+            Duration = 3,
+        })
+    end,
+})
+
+SpeedTab:CreateButton({
+    Name     = "Fast (200%)",
+    Callback = function()
+        Config.WeaponSpeedPercent = 200
+        if Config.WeaponSpeedEnabled then
+            applyWeaponSpeed(200)
+        end
+        Rayfield:Notify({
+            Title    = "Preset Applied",
+            Content  = "Weapon speed set to 200%",
+            Duration = 3,
+        })
+    end,
+})
+
+SpeedTab:CreateButton({
+    Name     = "Max Speed (300%)",
+    Callback = function()
+        Config.WeaponSpeedPercent = 300
+        if Config.WeaponSpeedEnabled then
+            applyWeaponSpeed(300)
+        end
+        Rayfield:Notify({
+            Title    = "Preset Applied",
+            Content  = "Weapon speed set to 300% (instant)",
+            Duration = 3,
+        })
+    end,
+})
+
+SpeedTab:CreateSection("Info")
+
+SpeedTab:CreateLabel("0%   = Slowest  (3x default reload)")
+SpeedTab:CreateLabel("100% = Default  (normal reload speed)")
+SpeedTab:CreateLabel("300% = Fastest  (near-instant reload)")
+SpeedTab:CreateLabel("Applies to: Bow, Daggers, Slingshot")
+
+-- ═══════════════════════════════════════════
 -- TARGETS TAB
 -- ═══════════════════════════════════════════
 local TargetsTab = Window:CreateTab("Targets", "crosshair")
@@ -292,16 +467,16 @@ local TargetsTab = Window:CreateTab("Targets", "crosshair")
 TargetsTab:CreateSection("Target Selection")
 
 TargetsTab:CreateDropdown({
-    Name         = "Target Mode",
-    Options      = {"All Enemies", "Nearest Enemy", "Specific Player"},
+    Name          = "Target Mode",
+    Options       = {"All Enemies", "Nearest Enemy", "Specific Player"},
     CurrentOption = "All Enemies",
-    Flag         = "TargetMode",
-    Callback     = function(v)
+    Flag          = "TargetMode",
+    Callback      = function(v)
         Config.TargetMode = v
         if v == "Specific Player" then
             Rayfield:Notify({
-                Title   = "Specific Player",
-                Content = "Enter a username in the box below",
+                Title    = "Specific Player",
+                Content  = "Enter a username in the box below",
                 Duration = 4,
             })
         end
@@ -309,20 +484,19 @@ TargetsTab:CreateDropdown({
 })
 
 TargetsTab:CreateInput({
-    Name        = "Specific Player Username",
-    PlaceholderText = "Enter exact username...",
+    Name                     = "Specific Player Username",
+    PlaceholderText          = "Enter exact username...",
     RemoveTextAfterFocusLost = false,
-    Flag        = "TargetUsername",
-    Callback    = function(v)
+    Flag                     = "TargetUsername",
+    Callback                 = function(v)
         Config.TargetPlayer = v
-        targetPlayerObj = nil
-        -- Search for the player
+        targetPlayerObj     = nil
         for _, p in ipairs(Players:GetPlayers()) do
             if p.Name:lower() == v:lower() or p.DisplayName:lower() == v:lower() then
                 targetPlayerObj = p
                 Rayfield:Notify({
-                    Title   = "Target Found",
-                    Content = "Targeting: " .. p.Name,
+                    Title    = "Target Found",
+                    Content  = "Targeting: " .. p.Name,
                     Duration = 3,
                 })
                 return
@@ -330,8 +504,8 @@ TargetsTab:CreateInput({
         end
         if v ~= "" then
             Rayfield:Notify({
-                Title   = "Not Found",
-                Content = "Player '"..v.."' not in server",
+                Title    = "Not Found",
+                Content  = "Player '" .. v .. "' not in server",
                 Duration = 3,
             })
         end
@@ -350,13 +524,13 @@ local function buildPlayerList()
     return names
 end
 
--- Refresh player list button
 TargetsTab:CreateButton({
     Name     = "Refresh Player List",
     Callback = function()
+        local list = buildPlayerList()
         Rayfield:Notify({
-            Title   = "Players in Server",
-            Content = table.concat(buildPlayerList(), ", "),
+            Title    = "Players in Server",
+            Content  = #list > 0 and table.concat(list, ", ") or "No other players",
             Duration = 5,
         })
     end,
@@ -371,14 +545,14 @@ TargetsTab:CreateButton({
             Config.TargetPlayer = nearest.Name
             targetPlayerObj     = nearest
             Rayfield:Notify({
-                Title   = "Target Set",
-                Content = "Now targeting: " .. nearest.Name,
+                Title    = "Target Set",
+                Content  = "Now targeting: " .. nearest.Name,
                 Duration = 3,
             })
         else
             Rayfield:Notify({
-                Title   = "No Enemies",
-                Content = "No other players found",
+                Title    = "No Enemies",
+                Content  = "No other players found",
                 Duration = 3,
             })
         end
@@ -397,6 +571,7 @@ InfoTab:CreateLabel("2. Tracks fast-moving parts (speed > threshold)")
 InfoTab:CreateLabel("3. Every Heartbeat: teleports them to 9000,9000,9000")
 InfoTab:CreateLabel("4. Enemies are also teleported away from you")
 InfoTab:CreateLabel("5. Their projectiles can't reach you")
+InfoTab:CreateLabel("6. Weapon Speed modifies ReloadLength via rawset")
 InfoTab:CreateLabel("")
 InfoTab:CreateLabel("Works for: Slingshot, Dagger, Bow, Arrow")
 InfoTab:CreateLabel("Does NOT require hookmetamethod")
@@ -406,19 +581,22 @@ InfoTab:CreateSection("Tips")
 InfoTab:CreateLabel("Use Nearest Enemy mode in 1v1")
 InfoTab:CreateLabel("Use All Enemies in FFA / team modes")
 InfoTab:CreateLabel("Higher void = safer from projectiles")
-InfoTab:CreateLabel("Disable Teleport Enemies if you want")
-InfoTab:CreateLabel("to only block projectiles (not move enemies)")
+InfoTab:CreateLabel("Set speed to 300% for instant reload")
+InfoTab:CreateLabel("Disable Teleport Enemies if you only")
+InfoTab:CreateLabel("want to block projectiles (not move enemies)")
 
 InfoTab:CreateSection("Emergency")
 
 InfoTab:CreateButton({
     Name     = "Force Stop Everything",
     Callback = function()
-        Config.Enabled = false
+        Config.Enabled            = false
+        Config.WeaponSpeedEnabled = false
         stopBypass()
+        resetWeaponSpeed()
         Rayfield:Notify({
-            Title   = "Stopped",
-            Content = "All bypass connections disconnected",
+            Title    = "Stopped",
+            Content  = "All bypass connections disconnected & speeds reset",
             Duration = 3,
         })
     end,
@@ -428,8 +606,8 @@ InfoTab:CreateButton({
 -- WELCOME
 -- ═══════════════════════════════════════════
 Rayfield:Notify({
-    Title   = "Rivals Projectile Bypass",
-    Content = "Loaded! Go to Main tab and enable bypass",
+    Title    = "Rivals Projectile Bypass",
+    Content  = "Loaded! Go to Main tab and enable bypass",
     Duration = 5,
 })
 
@@ -439,5 +617,10 @@ LocalPlayer.CharacterAdded:Connect(function()
     if Config.Enabled then
         task.wait(1)
         startBypass()
+    end
+    -- Re-apply weapon speed after respawn
+    if Config.WeaponSpeedEnabled then
+        task.wait(1)
+        applyWeaponSpeed(Config.WeaponSpeedPercent)
     end
 end)
