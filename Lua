@@ -8,10 +8,10 @@ local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 -- ═══════════════════════════════════════════
 -- SERVICES
 -- ═══════════════════════════════════════════
-local RunService         = game:GetService("RunService")
-local Players            = game:GetService("Players")
-local ReplicatedStorage  = game:GetService("ReplicatedStorage")
-local LocalPlayer        = Players.LocalPlayer
+local RunService        = game:GetService("RunService")
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer       = Players.LocalPlayer
 
 -- ═══════════════════════════════════════════
 -- STATE
@@ -22,27 +22,125 @@ local Config = {
     TeleportProj      = true,
     TeleportFastParts = true,
     VoidPos           = Vector3.new(9000, 9000, 9000),
-    WhitelistSelf     = true,
     TargetMode        = "All Enemies",
     TargetPlayer      = "",
     SpeedThreshold    = 50,
 
     -- Weapon Speed
     WeaponSpeedEnabled = false,
-    WeaponSpeedPercent = 100, -- 100% = normal, 0% = slowest, 300% = fastest
+    WeaponSpeedPercent = 100,
+
+    -- Projectile Prediction
+    PredictionEnabled    = false,
+    PredictionStrength   = 0.1,
+    PredictionMaxLead    = 5,
+    PredictionShowSphere = false,
 }
 
-local trackedParts      = {}
-local heartbeatConn     = nil
-local childAddedConn    = nil
-local childRemovedConn  = nil
-local targetPlayerObj   = nil
+local trackedParts     = {}
+local heartbeatConn    = nil
+local childAddedConn   = nil
+local childRemovedConn = nil
+local targetPlayerObj  = nil
+local predSphere       = nil
+
+-- ═══════════════════════════════════════════
+-- CONFIG SAVING / LOADING
+-- ═══════════════════════════════════════════
+local HttpService  = game:GetService("HttpService")
+local ConfigFolder = "unnamed"
+local ConfigFile   = ConfigFolder .. "/rivals_config.json"
+
+local SaveableKeys = {
+    "Enabled",
+    "TeleportEnemies",
+    "TeleportProj",
+    "TeleportFastParts",
+    "SpeedThreshold",
+    "TargetMode",
+    "TargetPlayer",
+    "WeaponSpeedEnabled",
+    "WeaponSpeedPercent",
+    "PredictionEnabled",
+    "PredictionStrength",
+    "PredictionMaxLead",
+    "PredictionShowSphere",
+    "VoidPosX",
+    "VoidPosY",
+    "VoidPosZ",
+}
+
+local function saveConfig()
+    local ok, err = pcall(function()
+        if not isfolder(ConfigFolder) then
+            makefolder(ConfigFolder)
+        end
+
+        local data = {}
+        for _, key in ipairs(SaveableKeys) do
+            if key == "VoidPosX" then
+                data[key] = Config.VoidPos.X
+            elseif key == "VoidPosY" then
+                data[key] = Config.VoidPos.Y
+            elseif key == "VoidPosZ" then
+                data[key] = Config.VoidPos.Z
+            else
+                data[key] = Config[key]
+            end
+        end
+
+        writefile(ConfigFile, HttpService:JSONEncode(data))
+    end)
+
+    if not ok then
+        Rayfield:Notify({
+            Title    = "Save Failed",
+            Content  = tostring(err),
+            Duration = 4,
+        })
+    end
+end
+
+local function loadConfig()
+    local ok, err = pcall(function()
+        if not isfolder(ConfigFolder) then
+            makefolder(ConfigFolder)
+        end
+        if not isfile(ConfigFile) then return end
+
+        local raw  = readfile(ConfigFile)
+        local data = HttpService:JSONDecode(raw)
+
+        for _, key in ipairs(SaveableKeys) do
+            if key == "VoidPosX" and data[key] then
+                Config.VoidPos = Vector3.new(data[key], Config.VoidPos.Y, Config.VoidPos.Z)
+            elseif key == "VoidPosY" and data[key] then
+                Config.VoidPos = Vector3.new(Config.VoidPos.X, data[key], Config.VoidPos.Z)
+            elseif key == "VoidPosZ" and data[key] then
+                Config.VoidPos = Vector3.new(Config.VoidPos.X, Config.VoidPos.Y, data[key])
+            else
+                if data[key] ~= nil then
+                    Config[key] = data[key]
+                end
+            end
+        end
+    end)
+
+    if not ok then
+        Rayfield:Notify({
+            Title    = "Load Failed",
+            Content  = tostring(err),
+            Duration = 4,
+        })
+    end
+end
+
+-- Load config immediately before UI is built
+loadConfig()
 
 -- ═══════════════════════════════════════════
 -- WEAPON SPEED
 -- ═══════════════════════════════════════════
-
--- Default reload lengths per weapon (100% baseline)
 local DefaultReloadLengths = {
     Bow       = 0,
     Daggers   = 0.09,
@@ -64,21 +162,16 @@ local function applyWeaponSpeed(percent)
             return
         end
 
-        -- percent: 0 = slowest (longest reload), 300 = fastest (shortest reload)
-        -- At 100%  → default reload length
-        -- At 0%    → 3x the default reload (300% slower)
-        -- At 300%  → 0 reload (instant)
-        local multiplier = (300 - percent) / 200  -- maps 0%→1.5x, 100%→1x, 300%→0x
+        local multiplier = (300 - percent) / 200
 
         for _, Item in Items do
             local Name = Item.Name
             if not table.find(WhitelistedItems, Name) then continue end
             if Item["ReloadLength"] == nil then continue end
 
-            local base    = DefaultReloadLengths[Name] or 0
-            local newVal  = math.clamp(base * multiplier, 0, base * 3)
+            local base   = DefaultReloadLengths[Name] or 0
+            local newVal = math.clamp(base * multiplier, 0, base * 3)
 
-            -- At 300% just force 0 / near-instant
             if percent >= 300 then
                 newVal = (Name == "Daggers") and 0.001 or 0
             end
@@ -97,7 +190,7 @@ local function applyWeaponSpeed(percent)
 end
 
 local function resetWeaponSpeed()
-    local ok, err = pcall(function()
+    pcall(function()
         local ItemLibrary = require(ReplicatedStorage.Modules.ItemLibrary)
         local Items       = rawget(ItemLibrary, "Items")
         if not Items then return end
@@ -109,9 +202,84 @@ local function resetWeaponSpeed()
             rawset(Item, "ReloadLength", DefaultReloadLengths[Name] or 0)
         end
     end)
+end
 
-    if not ok then
-        warn("resetWeaponSpeed error: " .. tostring(err))
+-- ═══════════════════════════════════════════
+-- PROJECTILE PREDICTION
+-- ═══════════════════════════════════════════
+
+-- Stores last known velocity per player for prediction
+local playerVelocityCache = {}
+
+local function getPredictedPosition(player)
+    local chr = player.Character
+    if not chr then return nil end
+    local hrp = chr:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local vel = hrp.AssemblyLinearVelocity
+
+    -- Cache velocity for trend tracking
+    if not playerVelocityCache[player] then
+        playerVelocityCache[player] = { vel = vel, t = tick() }
+    end
+
+    local cache    = playerVelocityCache[player]
+    local dt       = tick() - cache.t
+    local accel    = dt > 0 and (vel - cache.vel) / dt or Vector3.zero
+
+    -- Update cache
+    playerVelocityCache[player] = { vel = vel, t = tick() }
+
+    -- Lead time based on PredictionStrength
+    local leadTime = Config.PredictionStrength
+
+    -- Predicted position = current pos + vel*t + 0.5*accel*t^2
+    local predicted = hrp.Position
+        + vel    * leadTime
+        + accel  * 0.5 * leadTime * leadTime
+
+    -- Clamp lead distance so it doesn't overshoot wildly
+    local maxLead = Config.PredictionMaxLead
+    local delta   = predicted - hrp.Position
+    if delta.Magnitude > maxLead then
+        predicted = hrp.Position + delta.Unit * maxLead
+    end
+
+    return predicted
+end
+
+local function updatePredSphere(pos)
+    if not Config.PredictionShowSphere then
+        if predSphere then
+            predSphere:Destroy()
+            predSphere = nil
+        end
+        return
+    end
+
+    if not predSphere then
+        predSphere             = Instance.new("Part")
+        predSphere.Name        = "PredSphere"
+        predSphere.Shape       = Enum.PartType.Ball
+        predSphere.Size        = Vector3.new(2, 2, 2)
+        predSphere.Anchored    = true
+        predSphere.CanCollide  = false
+        predSphere.Material    = Enum.Material.Neon
+        predSphere.Color       = Color3.fromRGB(255, 50, 50)
+        predSphere.Transparency = 0.4
+        predSphere.Parent      = workspace
+    end
+
+    if pos then
+        predSphere.CFrame = CFrame.new(pos)
+    end
+end
+
+local function cleanupPredSphere()
+    if predSphere then
+        predSphere:Destroy()
+        predSphere = nil
     end
 end
 
@@ -162,7 +330,9 @@ local function stopBypass()
     if heartbeatConn    then heartbeatConn:Disconnect();    heartbeatConn    = nil end
     if childAddedConn   then childAddedConn:Disconnect();   childAddedConn   = nil end
     if childRemovedConn then childRemovedConn:Disconnect(); childRemovedConn = nil end
-    trackedParts = {}
+    trackedParts          = {}
+    playerVelocityCache   = {}
+    cleanupPredSphere()
 end
 
 local function startBypass()
@@ -174,7 +344,8 @@ local function startBypass()
             trackedParts[o] = true
         elseif o.Name == "Part" then
             task.defer(function()
-                if o and o.Parent and o.AssemblyLinearVelocity.Magnitude > Config.SpeedThreshold then
+                if o and o.Parent and
+                   o.AssemblyLinearVelocity.Magnitude > Config.SpeedThreshold then
                     trackedParts[o] = true
                 end
             end)
@@ -187,12 +358,36 @@ local function startBypass()
 
     heartbeatConn = RunService.Heartbeat:Connect(function()
         pcall(function()
-            local voidCF = getVoidCFrame()
+            local voidCF      = getVoidCFrame()
+            local nearestOnly = Config.TargetMode == "Nearest Enemy"
+                                and getNearestEnemy() or nil
+
+            -- ── Projectile Prediction ──
+            -- Find the primary target for prediction display
+            if Config.PredictionEnabled then
+                local predTarget = nil
+
+                if Config.TargetMode == "Nearest Enemy" then
+                    predTarget = nearestOnly
+                elseif Config.TargetMode == "Specific Player" then
+                    predTarget = targetPlayerObj
+                else
+                    -- All Enemies → show nearest for the sphere
+                    predTarget = getNearestEnemy()
+                end
+
+                if predTarget then
+                    local pos = getPredictedPosition(predTarget)
+                    updatePredSphere(pos)
+                else
+                    updatePredSphere(nil)
+                end
+            else
+                cleanupPredSphere()
+            end
 
             -- ── Teleport enemies ──
             if Config.TeleportEnemies then
-                local nearestOnly = Config.TargetMode == "Nearest Enemy" and getNearestEnemy() or nil
-
                 for _, p in ipairs(Players:GetPlayers()) do
                     if not shouldTargetPlayer(p) then continue end
 
@@ -206,7 +401,23 @@ local function startBypass()
                     if not skip and p.Character then
                         local h = p.Character:FindFirstChild("HumanoidRootPart")
                         if h then
-                            h.CFrame                  = voidCF
+                            -- Use predicted position for teleport destination
+                            -- so we "lead" where they are going
+                            if Config.PredictionEnabled then
+                                local predicted = getPredictedPosition(p)
+                                if predicted then
+                                    h.CFrame = CFrame.new(
+                                        predicted.X,
+                                        Config.VoidPos.Y,
+                                        predicted.Z
+                                    )
+                                else
+                                    h.CFrame = voidCF
+                                end
+                            else
+                                h.CFrame = voidCF
+                            end
+
                             h.AssemblyLinearVelocity  = Vector3.zero
                             h.AssemblyAngularVelocity = Vector3.zero
                         end
@@ -214,14 +425,15 @@ local function startBypass()
                 end
             end
 
-            -- ── Teleport tracked parts (CoreProjectile + fast parts) ──
+            -- ── Teleport tracked parts ──
             if Config.TeleportProj or Config.TeleportFastParts then
                 for part, _ in pairs(trackedParts) do
                     if part and part.Parent then
-                        local isProj  = part.Name == "CoreProjectile"
-                        local isFast  = not isProj
+                        local isProj = part.Name == "CoreProjectile"
+                        local isFast = not isProj
 
-                        if (isProj and Config.TeleportProj) or (isFast and Config.TeleportFastParts) then
+                        if (isProj and Config.TeleportProj) or
+                           (isFast and Config.TeleportFastParts) then
                             part.CFrame                 = voidCF
                             part.AssemblyLinearVelocity = Vector3.zero
                         end
@@ -242,9 +454,9 @@ local Window = Rayfield:CreateWindow({
     LoadingTitle    = "Rivals Bypass",
     LoadingSubtitle = "Slingshot · Dagger · Bow",
     ConfigurationSaving = {
-        Enabled    = true,
-        FolderName = "RivalsProjectileBypass",
-        FileName   = "Config",
+        Enabled    = false, -- We handle saving manually
+        FolderName = "unnamed",
+        FileName   = "rivals_config",
     },
     KeySystem = false,
 })
@@ -258,7 +470,7 @@ MainTab:CreateSection("Bypass Control")
 
 MainTab:CreateToggle({
     Name         = "Enable Bypass",
-    CurrentValue = false,
+    CurrentValue = Config.Enabled,
     Flag         = "BypassEnabled",
     Callback     = function(v)
         Config.Enabled = v
@@ -284,7 +496,7 @@ MainTab:CreateSection("What Gets Bypassed")
 
 MainTab:CreateToggle({
     Name         = "Teleport Enemies",
-    CurrentValue = true,
+    CurrentValue = Config.TeleportEnemies,
     Flag         = "TeleportEnemies",
     Callback     = function(v)
         Config.TeleportEnemies = v
@@ -293,7 +505,7 @@ MainTab:CreateToggle({
 
 MainTab:CreateToggle({
     Name         = "Teleport CoreProjectile",
-    CurrentValue = true,
+    CurrentValue = Config.TeleportProj,
     Flag         = "TeleportProj",
     Callback     = function(v)
         Config.TeleportProj = v
@@ -302,7 +514,7 @@ MainTab:CreateToggle({
 
 MainTab:CreateToggle({
     Name         = "Teleport Fast Parts",
-    CurrentValue = true,
+    CurrentValue = Config.TeleportFastParts,
     Flag         = "TeleportFastParts",
     Callback     = function(v)
         Config.TeleportFastParts = v
@@ -316,7 +528,7 @@ MainTab:CreateSlider({
     Range        = {1000, 50000},
     Increment    = 1000,
     Suffix       = " studs",
-    CurrentValue = 9000,
+    CurrentValue = Config.VoidPos.X,
     Flag         = "VoidX",
     Callback     = function(v)
         Config.VoidPos = Vector3.new(v, Config.VoidPos.Y, Config.VoidPos.Z)
@@ -328,7 +540,7 @@ MainTab:CreateSlider({
     Range        = {1000, 50000},
     Increment    = 1000,
     Suffix       = " studs",
-    CurrentValue = 9000,
+    CurrentValue = Config.VoidPos.Y,
     Flag         = "VoidY",
     Callback     = function(v)
         Config.VoidPos = Vector3.new(Config.VoidPos.X, v, Config.VoidPos.Z)
@@ -340,7 +552,7 @@ MainTab:CreateSlider({
     Range        = {1000, 50000},
     Increment    = 1000,
     Suffix       = " studs",
-    CurrentValue = 9000,
+    CurrentValue = Config.VoidPos.Z,
     Flag         = "VoidZ",
     Callback     = function(v)
         Config.VoidPos = Vector3.new(Config.VoidPos.X, Config.VoidPos.Y, v)
@@ -352,7 +564,7 @@ MainTab:CreateSlider({
     Range        = {10, 500},
     Increment    = 5,
     Suffix       = " studs/s",
-    CurrentValue = 50,
+    CurrentValue = Config.SpeedThreshold,
     Flag         = "SpeedThreshold",
     Callback     = function(v)
         Config.SpeedThreshold = v
@@ -368,7 +580,7 @@ SpeedTab:CreateSection("Bow · Daggers · Slingshot")
 
 SpeedTab:CreateToggle({
     Name         = "Enable Weapon Speed",
-    CurrentValue = false,
+    CurrentValue = Config.WeaponSpeedEnabled,
     Flag         = "WeaponSpeedEnabled",
     Callback     = function(v)
         Config.WeaponSpeedEnabled = v
@@ -395,7 +607,7 @@ SpeedTab:CreateSlider({
     Range        = {0, 300},
     Increment    = 1,
     Suffix       = "%",
-    CurrentValue = 100,
+    CurrentValue = Config.WeaponSpeedPercent,
     Flag         = "WeaponSpeedPercent",
     Callback     = function(v)
         Config.WeaponSpeedPercent = v
@@ -411,12 +623,10 @@ SpeedTab:CreateButton({
     Name     = "Normal Speed (100%)",
     Callback = function()
         Config.WeaponSpeedPercent = 100
-        if Config.WeaponSpeedEnabled then
-            applyWeaponSpeed(100)
-        end
+        if Config.WeaponSpeedEnabled then applyWeaponSpeed(100) end
         Rayfield:Notify({
             Title    = "Preset Applied",
-            Content  = "Weapon speed set to 100% (default)",
+            Content  = "Weapon speed → 100% (default)",
             Duration = 3,
         })
     end,
@@ -426,12 +636,10 @@ SpeedTab:CreateButton({
     Name     = "Fast (200%)",
     Callback = function()
         Config.WeaponSpeedPercent = 200
-        if Config.WeaponSpeedEnabled then
-            applyWeaponSpeed(200)
-        end
+        if Config.WeaponSpeedEnabled then applyWeaponSpeed(200) end
         Rayfield:Notify({
             Title    = "Preset Applied",
-            Content  = "Weapon speed set to 200%",
+            Content  = "Weapon speed → 200%",
             Duration = 3,
         })
     end,
@@ -441,12 +649,10 @@ SpeedTab:CreateButton({
     Name     = "Max Speed (300%)",
     Callback = function()
         Config.WeaponSpeedPercent = 300
-        if Config.WeaponSpeedEnabled then
-            applyWeaponSpeed(300)
-        end
+        if Config.WeaponSpeedEnabled then applyWeaponSpeed(300) end
         Rayfield:Notify({
             Title    = "Preset Applied",
-            Content  = "Weapon speed set to 300% (instant)",
+            Content  = "Weapon speed → 300% (instant)",
             Duration = 3,
         })
     end,
@@ -460,16 +666,136 @@ SpeedTab:CreateLabel("300% = Fastest  (near-instant reload)")
 SpeedTab:CreateLabel("Applies to: Bow, Daggers, Slingshot")
 
 -- ═══════════════════════════════════════════
+-- PREDICTION TAB
+-- ═══════════════════════════════════════════
+local PredTab = Window:CreateTab("Prediction", "crosshair")
+
+PredTab:CreateSection("Projectile Prediction")
+
+PredTab:CreateToggle({
+    Name         = "Enable Prediction",
+    CurrentValue = Config.PredictionEnabled,
+    Flag         = "PredictionEnabled",
+    Callback     = function(v)
+        Config.PredictionEnabled = v
+        if not v then
+            cleanupPredSphere()
+        end
+        Rayfield:Notify({
+            Title    = v and "Prediction ON" or "Prediction OFF",
+            Content  = v and "Leading enemy positions enabled"
+                          or "Prediction disabled",
+            Duration = 3,
+        })
+    end,
+})
+
+PredTab:CreateSlider({
+    Name         = "Prediction Strength (Lead Time)",
+    Range        = {0, 1},
+    Increment    = 0.01,
+    Suffix       = "s",
+    CurrentValue = Config.PredictionStrength,
+    Flag         = "PredictionStrength",
+    Callback     = function(v)
+        Config.PredictionStrength = v
+    end,
+})
+
+PredTab:CreateSlider({
+    Name         = "Max Lead Distance",
+    Range        = {1, 50},
+    Increment    = 1,
+    Suffix       = " studs",
+    CurrentValue = Config.PredictionMaxLead,
+    Flag         = "PredictionMaxLead",
+    Callback     = function(v)
+        Config.PredictionMaxLead = v
+    end,
+})
+
+PredTab:CreateToggle({
+    Name         = "Show Prediction Sphere",
+    CurrentValue = Config.PredictionShowSphere,
+    Flag         = "PredictionShowSphere",
+    Callback     = function(v)
+        Config.PredictionShowSphere = v
+        if not v then
+            cleanupPredSphere()
+        end
+    end,
+})
+
+PredTab:CreateSection("Presets")
+
+PredTab:CreateButton({
+    Name     = "Low Prediction (0.05s)",
+    Callback = function()
+        Config.PredictionStrength = 0.05
+        Rayfield:Notify({
+            Title    = "Preset Applied",
+            Content  = "Low prediction → 0.05s lead",
+            Duration = 3,
+        })
+    end,
+})
+
+PredTab:CreateButton({
+    Name     = "Medium Prediction (0.1s)",
+    Callback = function()
+        Config.PredictionStrength = 0.1
+        Rayfield:Notify({
+            Title    = "Preset Applied",
+            Content  = "Medium prediction → 0.1s lead",
+            Duration = 3,
+        })
+    end,
+})
+
+PredTab:CreateButton({
+    Name     = "High Prediction (0.2s)",
+    Callback = function()
+        Config.PredictionStrength = 0.2
+        Rayfield:Notify({
+            Title    = "Preset Applied",
+            Content  = "High prediction → 0.2s lead",
+            Duration = 3,
+        })
+    end,
+})
+
+PredTab:CreateButton({
+    Name     = "Max Prediction (0.5s)",
+    Callback = function()
+        Config.PredictionStrength = 0.5
+        Rayfield:Notify({
+            Title    = "Preset Applied",
+            Content  = "Max prediction → 0.5s lead",
+            Duration = 3,
+        })
+    end,
+})
+
+PredTab:CreateSection("How Prediction Works")
+
+PredTab:CreateLabel("Tracks enemy velocity + acceleration")
+PredTab:CreateLabel("Leads their position by the lead time")
+PredTab:CreateLabel("Teleport aims at predicted future position")
+PredTab:CreateLabel("Red sphere shows predicted target point")
+PredTab:CreateLabel("Higher lead = better for fast moving targets")
+PredTab:CreateLabel("Too high = overshoots slow targets")
+
+-- ═══════════════════════════════════════════
 -- TARGETS TAB
 -- ═══════════════════════════════════════════
-local TargetsTab = Window:CreateTab("Targets", "crosshair")
+local TargetsTab = Window:CreateTab("Targets", "users")
 
 TargetsTab:CreateSection("Target Selection")
 
 TargetsTab:CreateDropdown({
     Name          = "Target Mode",
     Options       = {"All Enemies", "Nearest Enemy", "Specific Player"},
-    CurrentOption = "All Enemies",
+    CurrentOption = Config.TargetMode,
     Flag          = "TargetMode",
     Callback      = function(v)
         Config.TargetMode = v
@@ -492,7 +818,8 @@ TargetsTab:CreateInput({
         Config.TargetPlayer = v
         targetPlayerObj     = nil
         for _, p in ipairs(Players:GetPlayers()) do
-            if p.Name:lower() == v:lower() or p.DisplayName:lower() == v:lower() then
+            if p.Name:lower() == v:lower() or
+               p.DisplayName:lower() == v:lower() then
                 targetPlayerObj = p
                 Rayfield:Notify({
                     Title    = "Target Found",
@@ -560,6 +887,124 @@ TargetsTab:CreateButton({
 })
 
 -- ═══════════════════════════════════════════
+-- CONFIG TAB
+-- ═══════════════════════════════════════════
+local ConfigTab = Window:CreateTab("Config", "save")
+
+ConfigTab:CreateSection("Save & Load")
+
+ConfigTab:CreateLabel("Config saves to: unnamed/rivals_config.json")
+ConfigTab:CreateLabel("Config auto-loads when script starts")
+
+ConfigTab:CreateButton({
+    Name     = "Save Config",
+    Callback = function()
+        saveConfig()
+        Rayfield:Notify({
+            Title    = "Config Saved",
+            Content  = "Saved to unnamed/rivals_config.json",
+            Duration = 3,
+        })
+    end,
+})
+
+ConfigTab:CreateButton({
+    Name     = "Load Config",
+    Callback = function()
+        loadConfig()
+        -- Re-apply loaded settings
+        if Config.Enabled then
+            startBypass()
+        else
+            stopBypass()
+        end
+        if Config.WeaponSpeedEnabled then
+            applyWeaponSpeed(Config.WeaponSpeedPercent)
+        end
+        Rayfield:Notify({
+            Title    = "Config Loaded",
+            Content  = "Settings loaded from file",
+            Duration = 3,
+        })
+    end,
+})
+
+ConfigTab:CreateButton({
+    Name     = "Reset Config to Default",
+    Callback = function()
+        Config.Enabled              = false
+        Config.TeleportEnemies      = true
+        Config.TeleportProj         = true
+        Config.TeleportFastParts    = true
+        Config.VoidPos              = Vector3.new(9000, 9000, 9000)
+        Config.TargetMode           = "All Enemies"
+        Config.TargetPlayer         = ""
+        Config.SpeedThreshold       = 50
+        Config.WeaponSpeedEnabled   = false
+        Config.WeaponSpeedPercent   = 100
+        Config.PredictionEnabled    = false
+        Config.PredictionStrength   = 0.1
+        Config.PredictionMaxLead    = 5
+        Config.PredictionShowSphere = false
+
+        stopBypass()
+        resetWeaponSpeed()
+        cleanupPredSphere()
+        saveConfig()
+
+        Rayfield:Notify({
+            Title    = "Config Reset",
+            Content  = "All settings reset to default",
+            Duration = 3,
+        })
+    end,
+})
+
+ConfigTab:CreateSection("Auto Save")
+
+ConfigTab:CreateToggle({
+    Name         = "Auto Save on Change",
+    CurrentValue = false,
+    Flag         = "AutoSave",
+    Callback     = function(v)
+        -- Wrap all config-changing callbacks with auto save
+        -- We poll this flag in a loop
+        if v then
+            task.spawn(function()
+                while Config do
+                    task.wait(10)
+                    -- Only save if autosave still on
+                    local flags = Rayfield.Flags
+                    if flags and flags["AutoSave"] and flags["AutoSave"].Value then
+                        saveConfig()
+                    else
+                        break
+                    end
+                end
+            end)
+            Rayfield:Notify({
+                Title    = "Auto Save ON",
+                Content  = "Config saves every 10 seconds",
+                Duration = 3,
+            })
+        else
+            Rayfield:Notify({
+                Title    = "Auto Save OFF",
+                Content  = "Remember to save manually",
+                Duration = 3,
+            })
+        end
+    end,
+})
+
+ConfigTab:CreateSection("File Info")
+
+ConfigTab:CreateLabel("Folder : unnamed")
+ConfigTab:CreateLabel("File   : rivals_config.json")
+ConfigTab:CreateLabel("Format : JSON")
+ConfigTab:CreateLabel("Auto-loaded on every script start")
+
+-- ═══════════════════════════════════════════
 -- INFO TAB
 -- ═══════════════════════════════════════════
 local InfoTab = Window:CreateTab("Info", "info")
@@ -568,13 +1013,10 @@ InfoTab:CreateSection("How It Works")
 
 InfoTab:CreateLabel("1. Tracks CoreProjectile in workspace")
 InfoTab:CreateLabel("2. Tracks fast-moving parts (speed > threshold)")
-InfoTab:CreateLabel("3. Every Heartbeat: teleports them to 9000,9000,9000")
-InfoTab:CreateLabel("4. Enemies are also teleported away from you")
-InfoTab:CreateLabel("5. Their projectiles can't reach you")
-InfoTab:CreateLabel("6. Weapon Speed modifies ReloadLength via rawset")
-InfoTab:CreateLabel("")
-InfoTab:CreateLabel("Works for: Slingshot, Dagger, Bow, Arrow")
-InfoTab:CreateLabel("Does NOT require hookmetamethod")
+InfoTab:CreateLabel("3. Every Heartbeat: teleports them to void")
+InfoTab:CreateLabel("4. Enemies teleported away from you")
+InfoTab:CreateLabel("5. Prediction leads enemy position forward")
+InfoTab:CreateLabel("6. Weapon Speed modifies ReloadLength")
 
 InfoTab:CreateSection("Tips")
 
@@ -582,8 +1024,7 @@ InfoTab:CreateLabel("Use Nearest Enemy mode in 1v1")
 InfoTab:CreateLabel("Use All Enemies in FFA / team modes")
 InfoTab:CreateLabel("Higher void = safer from projectiles")
 InfoTab:CreateLabel("Set speed to 300% for instant reload")
-InfoTab:CreateLabel("Disable Teleport Enemies if you only")
-InfoTab:CreateLabel("want to block projectiles (not move enemies)")
+InfoTab:CreateLabel("Prediction 0.1s works best for most cases")
 
 InfoTab:CreateSection("Emergency")
 
@@ -592,11 +1033,13 @@ InfoTab:CreateButton({
     Callback = function()
         Config.Enabled            = false
         Config.WeaponSpeedEnabled = false
+        Config.PredictionEnabled  = false
         stopBypass()
         resetWeaponSpeed()
+        cleanupPredSphere()
         Rayfield:Notify({
             Title    = "Stopped",
-            Content  = "All bypass connections disconnected & speeds reset",
+            Content  = "All systems disabled & reset",
             Duration = 3,
         })
     end,
@@ -607,20 +1050,41 @@ InfoTab:CreateButton({
 -- ═══════════════════════════════════════════
 Rayfield:Notify({
     Title    = "Rivals Projectile Bypass",
-    Content  = "Loaded! Go to Main tab and enable bypass",
+    Content  = "Loaded! Config auto-loaded from unnamed/",
     Duration = 5,
 })
 
--- Clean up on character respawn
+-- ═══════════════════════════════════════════
+-- RESPAWN HANDLER
+-- ═══════════════════════════════════════════
 LocalPlayer.CharacterAdded:Connect(function()
-    trackedParts = {}
+    trackedParts        = {}
+    playerVelocityCache = {}
+    cleanupPredSphere()
+
     if Config.Enabled then
         task.wait(1)
         startBypass()
     end
-    -- Re-apply weapon speed after respawn
+
     if Config.WeaponSpeedEnabled then
         task.wait(1)
         applyWeaponSpeed(Config.WeaponSpeedPercent)
     end
 end)
+
+-- ═══════════════════════════════════════════
+-- PLAYER REMOVED → CLEAN CACHE
+-- ═══════════════════════════════════════════
+Players.PlayerRemoving:Connect(function(p)
+    playerVelocityCache[p] = nil
+end)
+
+-- Apply saved settings on load
+if Config.Enabled then
+    startBypass()
+end
+
+if Config.WeaponSpeedEnabled then
+    applyWeaponSpeed(Config.WeaponSpeedPercent)
+end
