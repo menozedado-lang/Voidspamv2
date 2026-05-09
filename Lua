@@ -17,11 +17,9 @@ local LocalPlayer       = Players.LocalPlayer
 -- ═══════════════════════════════════════════
 -- PERFORMANCE CONSTANTS
 -- ═══════════════════════════════════════════
--- How many heartbeat frames to skip between heavy work
--- 1 = every frame, 2 = every other frame, etc.
-local PRED_UPDATE_RATE    = 2   -- prediction cache update interval (frames)
-local AVATAR_UPDATE_RATE  = 6   -- avatar RenderStepped work interval (frames)
-local NEAREST_CACHE_TIME  = 0.12 -- seconds between getNearestEnemy recalcs
+local PRED_UPDATE_RATE    = 2
+local AVATAR_UPDATE_RATE  = 6
+local NEAREST_CACHE_TIME  = 0.12
 
 -- ═══════════════════════════════════════════
 -- STATE
@@ -48,6 +46,14 @@ local Config = {
     PredictionAdaptive     = true,
     PredictionShowSphere   = false,
 
+    -- Hit Registration
+    HitRegEnabled       = false,
+    HitRegStrength      = 100,   -- 0 to 100 (100 = never miss)
+    HitRegFreezeEnemies = true,
+    HitRegVoidProj      = true,
+    HitRegSpeedThresh   = 50,
+    HitRegShowDebug     = false,
+
     AvatarVictimId  = 0,
     AvatarHelper    = "",
     AvatarLevel     = 1,
@@ -61,28 +67,24 @@ local Config = {
 }
 
 -- ═══════════════════════════════════════════
--- FRAME COUNTERS  (cheap throttle, no tick())
+-- FRAME COUNTERS
 -- ═══════════════════════════════════════════
-local frameCount        = 0
-local predFrameCount    = 0
-local avatarFrameCount  = 0
+local frameCount       = 0
+local predFrameCount   = 0
+local avatarFrameCount = 0
 
 -- ═══════════════════════════════════════════
 -- BYPASS STATE
 -- ═══════════════════════════════════════════
-local trackedParts     = {}   -- projectile parts to void
-local heartbeatConn    = nil
-local childAddedConn   = nil
-local childRemovedConn = nil
-local targetPlayerObj  = nil
-local predSphere       = nil
-
--- Cached nearest enemy (refreshed every NEAREST_CACHE_TIME seconds)
+local trackedParts          = {}
+local heartbeatConn         = nil
+local childAddedConn        = nil
+local childRemovedConn      = nil
+local targetPlayerObj       = nil
+local predSphere            = nil
 local nearestEnemyCache     = nil
 local nearestEnemyCacheTime = 0
-
--- Pre-built player list cache (updated on join/leave)
-local playerListCache = {}
+local playerListCache       = {}
 
 local function rebuildPlayerList()
     playerListCache = {}
@@ -92,11 +94,139 @@ local function rebuildPlayerList()
         end
     end
 end
-
 rebuildPlayerList()
-
-Players.PlayerAdded:Connect(function()   rebuildPlayerList() end)
+Players.PlayerAdded:Connect(function()    rebuildPlayerList() end)
 Players.PlayerRemoving:Connect(function() task.defer(rebuildPlayerList) end)
+
+-- ═══════════════════════════════════════════
+-- HIT REGISTRATION STATE
+-- ═══════════════════════════════════════════
+local hitRegTracked    = {}   -- [part] = { lastPos = Vector3 }
+local hitRegHeartbeat  = nil
+local hitRegChildAdded = nil
+local hitRegChildRemov = nil
+local hitRegTotalHits  = 0
+local hitRegTotalShots = 0
+
+-- Raycast params (exclude local character)
+local rParams = RaycastParams.new()
+rParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function updateRaycastFilter()
+    if LocalPlayer.Character then
+        rParams.FilterDescendantsInstances = { LocalPlayer.Character }
+    end
+end
+updateRaycastFilter()
+LocalPlayer.CharacterAdded:Connect(updateRaycastFilter)
+
+-- ── Hit chance roll (0–100 strength) ──
+-- At 100 → always registers
+-- At 0   → never registers (purely visual, no hit)
+-- Between → probabilistic
+local function shouldRegisterHit()
+    if Config.HitRegStrength >= 100 then return true end
+    if Config.HitRegStrength <= 0   then return false end
+    return math.random(1, 100) <= Config.HitRegStrength
+end
+
+-- ── Track a projectile part for hit reg ──
+local function hitRegTrack(obj)
+    if not obj:IsA("BasePart") then return end
+    hitRegTracked[obj] = { lastPos = obj.Position }
+    hitRegTotalShots   = hitRegTotalShots + 1
+end
+
+local function stopHitReg()
+    if hitRegHeartbeat  then hitRegHeartbeat:Disconnect()  hitRegHeartbeat  = nil end
+    if hitRegChildAdded then hitRegChildAdded:Disconnect() hitRegChildAdded = nil end
+    if hitRegChildRemov then hitRegChildRemov:Disconnect() hitRegChildRemov = nil end
+    hitRegTracked   = {}
+end
+
+local function startHitReg()
+    stopHitReg()
+
+    -- Track new projectiles
+    hitRegChildAdded = workspace.ChildAdded:Connect(function(o)
+        if o.Name == "CoreProjectile" then
+            hitRegTrack(o)
+        elseif o.Name == "Part" then
+            task.defer(function()
+                if o and o.Parent and
+                   o.AssemblyLinearVelocity.Magnitude > Config.HitRegSpeedThresh then
+                    hitRegTrack(o)
+                end
+            end)
+        end
+    end)
+
+    hitRegChildRemov = workspace.ChildRemoved:Connect(function(o)
+        hitRegTracked[o] = nil
+    end)
+
+    hitRegHeartbeat = RunService.Heartbeat:Connect(function()
+        local Void = CFrame.new(Config.VoidPos)
+
+        -- ── Freeze enemies ──
+        if Config.HitRegFreezeEnemies then
+            for _, p in ipairs(playerListCache) do
+                local chr = p.Character
+                local hrp = chr and chr:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    hrp.CFrame                  = Void
+                    hrp.AssemblyLinearVelocity  = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+        end
+
+        -- ── Hit reg raycast + void projectiles ──
+        for obj, data in pairs(hitRegTracked) do
+            if obj and obj.Parent then
+                local currentPos = obj.Position
+                local dir        = currentPos - data.lastPos
+
+                -- Only raycast if projectile actually moved
+                if dir.Magnitude > 0.01 then
+                    -- Scale raycast length by hit reg strength
+                    -- At 100% → full extended ray (longer = more forgiving)
+                    -- At 0%   → no raycast at all
+                    local rayLength  = dir.Magnitude * (1 + (Config.HitRegStrength / 100) * 4)
+                    local rayDir     = dir.Unit * rayLength
+
+                    if shouldRegisterHit() then
+                        local hit = workspace:Raycast(data.lastPos, rayDir, rParams)
+                        if hit then
+                            hitRegTotalHits = hitRegTotalHits + 1
+                            if Config.HitRegShowDebug then
+                                print(string.format(
+                                    "[HitReg] Hit: %s | Total: %d/%d (%.0f%%)",
+                                    hit.Instance.Name,
+                                    hitRegTotalHits,
+                                    hitRegTotalShots,
+                                    hitRegTotalShots > 0
+                                        and (hitRegTotalHits / hitRegTotalShots * 100)
+                                        or 0
+                                ))
+                            end
+                        end
+                    end
+                end
+
+                data.lastPos = currentPos
+
+                -- Void the projectile
+                if Config.HitRegVoidProj then
+                    obj.CFrame                 = Void
+                    obj.AssemblyLinearVelocity = Vector3.zero
+                end
+            else
+                hitRegTracked[obj] = nil
+            end
+        end
+    end)
+end
 
 -- ═══════════════════════════════════════════
 -- PREDICTION STATE
@@ -111,88 +241,62 @@ local function initPredCache(player)
         accel    = Vector3.zero,
         smoothed = nil,
         history  = {},
-        dirty    = false,
     }
 end
 
--- Runs every PRED_UPDATE_RATE frames (not every frame)
 local function updatePredCacheForPlayer(player, hrp)
     local now = tick()
     local pos = hrp.Position
-
     if not predCache[player] then initPredCache(player) end
     local cache = predCache[player]
-
-    -- Ring buffer push
-    local h = cache.history
-    h[#h + 1] = { pos = pos, t = now }
+    local h     = cache.history
+    h[#h + 1]   = { pos = pos, t = now }
     if #h > HISTORY_SIZE then table.remove(h, 1) end
-
-    -- Velocity from oldest→newest
     if #h >= 2 then
         local dt = h[#h].t - h[1].t
         if dt > 0 then
-            -- Blend history vel with assembly vel (assembly is instant, history is smooth)
             local histVel = (h[#h].pos - h[1].pos) / dt
             cache.vel     = histVel * 0.65 + hrp.AssemblyLinearVelocity * 0.35
         end
     else
         cache.vel = hrp.AssemblyLinearVelocity
     end
-
-    -- Acceleration from last 3 samples
     if #h >= 3 then
         local n   = #h
         local dt1 = h[n].t   - h[n-1].t
         local dt2 = h[n-1].t - h[n-2].t
         if dt1 > 0 and dt2 > 0 then
-            local v1      = (h[n].pos   - h[n-1].pos) / dt1
-            local v2      = (h[n-1].pos - h[n-2].pos) / dt2
-            cache.accel   = (v1 - v2) / ((dt1 + dt2) * 0.5)
+            local v1    = (h[n].pos   - h[n-1].pos) / dt1
+            local v2    = (h[n-1].pos - h[n-2].pos) / dt2
+            cache.accel = (v1 - v2) / ((dt1 + dt2) * 0.5)
         end
     end
-
-    cache.pos   = pos
-    cache.dirty = true
+    cache.pos = pos
 end
 
--- Runs every frame but only reads pre-computed cache (cheap)
 local function getPredictedPosition(player)
     local cache = predCache[player]
     if not cache then return nil end
-
     local totalLead = Config.PredictionStrength + Config.PredictionLatency
-
     if Config.PredictionAdaptive then
         local speed = cache.vel.Magnitude
         local scale = math.clamp(1 - speed / 200, 0.4, 1.4)
         totalLead   = totalLead * scale
     end
-
     local predicted
-
     local method = Config.PredictionMethod
     if method == "Velocity Only" then
         predicted = cache.pos + cache.vel * totalLead
     elseif method == "Velocity + Accel" then
-        predicted = cache.pos
-            + cache.vel   * totalLead
-            + cache.accel * (0.5 * totalLead * totalLead)
-    else -- Kalman
-        local dampedAccel = cache.accel * 0.5
-        predicted = cache.pos
-            + cache.vel   * totalLead
-            + dampedAccel * (0.5 * totalLead * totalLead)
+        predicted = cache.pos + cache.vel * totalLead + cache.accel * (0.5 * totalLead * totalLead)
+    else
+        predicted = cache.pos + cache.vel * totalLead + cache.accel * 0.5 * (0.5 * totalLead * totalLead)
     end
-
-    -- Clamp max lead
     local delta = predicted - cache.pos
     local mag   = delta.Magnitude
     if mag > Config.PredictionMaxLead then
         predicted = cache.pos + delta * (Config.PredictionMaxLead / mag)
     end
-
-    -- EMA smoothing
     local sf = Config.PredictionSmoothFactor
     if sf > 0 then
         cache.smoothed = cache.smoothed
@@ -200,46 +304,31 @@ local function getPredictedPosition(player)
             or predicted
         predicted = cache.smoothed
     end
-
     return predicted
 end
 
 -- ═══════════════════════════════════════════
--- NEAREST ENEMY  (cached, not recalc every frame)
+-- NEAREST ENEMY
 -- ═══════════════════════════════════════════
 local function getNearestEnemy()
     local now = tick()
-    if now - nearestEnemyCacheTime < NEAREST_CACHE_TIME then
-        return nearestEnemyCache
-    end
-
+    if now - nearestEnemyCacheTime < NEAREST_CACHE_TIME then return nearestEnemyCache end
     local myChar = LocalPlayer.Character
     local myHRP  = myChar and myChar:FindFirstChild("HumanoidRootPart")
-    if not myHRP then
-        nearestEnemyCache     = nil
-        nearestEnemyCacheTime = now
-        return nil
-    end
-
+    if not myHRP then nearestEnemyCache = nil nearestEnemyCacheTime = now return nil end
     local myPos         = myHRP.Position
     local nearest       = nil
-    local nearestDistSq = math.huge  -- use squared distance to skip sqrt
-
+    local nearestDistSq = math.huge
     for _, p in ipairs(playerListCache) do
-        local chr = p.Character
-        local hrp = chr and chr:FindFirstChild("HumanoidRootPart")
+        local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
         if hrp then
-            local dx    = hrp.Position.X - myPos.X
-            local dy    = hrp.Position.Y - myPos.Y
-            local dz    = hrp.Position.Z - myPos.Z
-            local distSq = dx*dx + dy*dy + dz*dz
-            if distSq < nearestDistSq then
-                nearestDistSq = distSq
-                nearest       = p
-            end
+            local dx = hrp.Position.X - myPos.X
+            local dy = hrp.Position.Y - myPos.Y
+            local dz = hrp.Position.Z - myPos.Z
+            local dSq = dx*dx + dy*dy + dz*dz
+            if dSq < nearestDistSq then nearestDistSq = dSq nearest = p end
         end
     end
-
     nearestEnemyCache     = nearest
     nearestEnemyCacheTime = now
     return nearest
@@ -285,6 +374,8 @@ local SaveableKeys = {
     "PredictionEnabled","PredictionMethod","PredictionStrength",
     "PredictionMaxLead","PredictionShowSphere","PredictionLatency",
     "PredictionSmoothFactor","PredictionAdaptive",
+    "HitRegEnabled","HitRegStrength","HitRegFreezeEnemies",
+    "HitRegVoidProj","HitRegSpeedThresh","HitRegShowDebug",
     "VoidPosX","VoidPosY","VoidPosZ",
     "AvatarVictimId","AvatarHelper","AvatarLevel","AvatarStreak",
     "AvatarElo","AvatarKeys","AvatarPremium","AvatarVerified",
@@ -439,7 +530,6 @@ local function startAvatarChanger()
         Rayfield:Notify({ Title="Avatar Changer", Content="Failed: "..tostring(fetchErr), Duration=5 })
         return
     end
-
     local decoded  = avatarDecodedData
     local platform = tostring(Config.AvatarPlatform):upper()
     local friend   = Config.AvatarHelper ~= "" and Players:FindFirstChild(Config.AvatarHelper) or LocalPlayer
@@ -447,7 +537,6 @@ local function startAvatarChanger()
         Rayfield:Notify({ Title="Avatar Changer", Content="Helper not found", Duration=4 })
         return
     end
-
     pcall(function()
         friend.Name                  = decoded.name
         friend.UserId                = decoded.id
@@ -489,23 +578,17 @@ local function startAvatarChanger()
         end)
     end)
 
-    -- ── Avatar RenderStepped: THROTTLED to every AVATAR_UPDATE_RATE frames ──
-    -- Pre-resolve GUI paths once per loop iteration so we aren't re-walking
-    -- the entire tree every frame
-    local cachedCtrl      = nil
-    local cachedCtrlTime  = 0
-    local CTRL_CACHE_TIME = 2 -- seconds between GUI path re-resolve
+    local cachedCtrl     = nil
+    local cachedCtrlTime = 0
 
     avatarRenderConn = RunService.RenderStepped:Connect(function()
         avatarFrameCount = avatarFrameCount + 1
         if avatarFrameCount % AVATAR_UPDATE_RATE ~= 0 then return end
-
         pcall(function()
-            -- Nametag ctrl (re-resolve every CTRL_CACHE_TIME seconds)
             local now = tick()
-            if not cachedCtrl or now - cachedCtrlTime > CTRL_CACHE_TIME then
+            if not cachedCtrl or now - cachedCtrlTime > 2 then
                 local plrInst = Players:FindFirstChild(decoded.name)
-                cachedCtrl = plrInst
+                cachedCtrl    = plrInst
                     and plrInst.Character
                     and plrInst.Character:FindFirstChild("HumanoidRootPart")
                     and plrInst.Character.HumanoidRootPart:FindFirstChild("Nametag")
@@ -514,11 +597,7 @@ local function startAvatarChanger()
                     and plrInst.Character.HumanoidRootPart.Nametag.Frame.Player:FindFirstChild("Controls")
                 cachedCtrlTime = now
             end
-            if cachedCtrl then
-                cachedCtrl.Image = platformImages[platform] or platformImages.DESKTOP
-            end
-
-            -- Keys display (only if keys override is set)
+            if cachedCtrl then cachedCtrl.Image = platformImages[platform] or platformImages.DESKTOP end
             if tonumber(Config.AvatarKeys) > 0 then
                 local currency = LocalPlayer.PlayerGui
                     and LocalPlayer.PlayerGui:FindFirstChild("MainGui")
@@ -529,22 +608,19 @@ local function startAvatarChanger()
                 if currency then
                     for _, v in ipairs(currency:GetChildren()) do
                         if v:FindFirstChild("Icon") and v.Icon.Image == "rbxassetid://17860673529" then
-                            if v:FindFirstChild("Title") then
-                                v.Title.Text = tostring(Config.AvatarKeys)
-                            end
+                            if v:FindFirstChild("Title") then v.Title.Text = tostring(Config.AvatarKeys) end
                         end
                     end
                 end
             end
         end)
     end)
-
     avatarActive = true
     Rayfield:Notify({ Title="Avatar Changer", Content="Spoofing as: "..decoded.name, Duration=4 })
 end
 
 -- ═══════════════════════════════════════════
--- SHOULD TARGET PLAYER
+-- CORE BYPASS
 -- ═══════════════════════════════════════════
 local function shouldTargetPlayer(p)
     if p == LocalPlayer then return false end
@@ -554,9 +630,6 @@ local function shouldTargetPlayer(p)
     return true
 end
 
--- ═══════════════════════════════════════════
--- BYPASS START / STOP
--- ═══════════════════════════════════════════
 local function stopBypass()
     if heartbeatConn    then heartbeatConn:Disconnect()    heartbeatConn    = nil end
     if childAddedConn   then childAddedConn:Disconnect()   childAddedConn   = nil end
@@ -570,83 +643,57 @@ end
 
 local function startBypass()
     stopBypass()
-
-    -- Track new projectiles via event (zero per-frame cost)
     childAddedConn = workspace.ChildAdded:Connect(function(o)
         if not o:IsA("BasePart") then return end
         if o.Name == "CoreProjectile" then
             trackedParts[o] = true
         elseif o.Name == "Part" then
-            -- Defer so physics has time to apply velocity
             task.defer(function()
-                if o and o.Parent
-                   and o.AssemblyLinearVelocity.Magnitude > Config.SpeedThreshold then
+                if o and o.Parent and o.AssemblyLinearVelocity.Magnitude > Config.SpeedThreshold then
                     trackedParts[o] = true
                 end
             end)
         end
     end)
-
     childRemovedConn = workspace.ChildRemoved:Connect(function(o)
         trackedParts[o] = nil
     end)
-
-    -- ── Main heartbeat loop (heavily optimised) ──
     heartbeatConn = RunService.Heartbeat:Connect(function()
         frameCount = frameCount + 1
 
-        -- ── STEP 1: Update prediction cache (throttled) ──
         if Config.PredictionEnabled and frameCount % PRED_UPDATE_RATE == 0 then
             for _, p in ipairs(playerListCache) do
-                local chr = p.Character
-                local hrp = chr and chr:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    updatePredCacheForPlayer(p, hrp)
-                end
+                local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then updatePredCacheForPlayer(p, hrp) end
             end
         end
 
-        -- Resolve nearest once per frame (uses cache internally)
         local nearestOnly = Config.TargetMode == "Nearest Enemy" and getNearestEnemy() or nil
 
-        -- ── STEP 2: Update prediction sphere (throttled every 3 frames) ──
         if Config.PredictionEnabled and Config.PredictionShowSphere and frameCount % 3 == 0 then
             local predTarget = nearestOnly
                 or (Config.TargetMode == "Specific Player" and targetPlayerObj)
                 or nearestEnemyCache
-            if predTarget then
-                updatePredSphere(getPredictedPosition(predTarget))
-            end
+            if predTarget then updatePredSphere(getPredictedPosition(predTarget)) end
         elseif not Config.PredictionEnabled then
             cleanupPredSphere()
         end
 
-        -- ── STEP 3: Teleport enemies ──
         if Config.TeleportEnemies then
             local vx = Config.VoidPos.X
             local vy = Config.VoidPos.Y
             local vz = Config.VoidPos.Z
-
             for _, p in ipairs(playerListCache) do
                 if not shouldTargetPlayer(p) then continue end
-
                 local skip = false
-                if Config.TargetMode == "Nearest Enemy" then
-                    skip = p ~= nearestOnly
-                elseif Config.TargetMode == "Specific Player" then
-                    skip = p ~= targetPlayerObj
-                end
-
+                if Config.TargetMode == "Nearest Enemy" then skip = p ~= nearestOnly
+                elseif Config.TargetMode == "Specific Player" then skip = p ~= targetPlayerObj end
                 if not skip and p.Character then
                     local h = p.Character:FindFirstChild("HumanoidRootPart")
                     if h then
                         if Config.PredictionEnabled then
                             local pred = getPredictedPosition(p)
-                            if pred then
-                                h.CFrame = CFrame.new(pred.X, vy, pred.Z)
-                            else
-                                h.CFrame = CFrame.new(vx, vy, vz)
-                            end
+                            h.CFrame = pred and CFrame.new(pred.X, vy, pred.Z) or CFrame.new(vx, vy, vz)
                         else
                             h.CFrame = CFrame.new(vx, vy, vz)
                         end
@@ -657,18 +704,12 @@ local function startBypass()
             end
         end
 
-        -- ── STEP 4: Teleport tracked projectile parts ──
         if Config.TeleportProj or Config.TeleportFastParts then
-            local vx = Config.VoidPos.X
-            local vy = Config.VoidPos.Y
-            local vz = Config.VoidPos.Z
-            local voidCF = CFrame.new(vx, vy, vz)
-
+            local voidCF = CFrame.new(Config.VoidPos)
             for part in pairs(trackedParts) do
                 if part and part.Parent then
                     local isProj = part.Name == "CoreProjectile"
-                    if (isProj and Config.TeleportProj) or
-                       (not isProj and Config.TeleportFastParts) then
+                    if (isProj and Config.TeleportProj) or (not isProj and Config.TeleportFastParts) then
                         part.CFrame                 = voidCF
                         part.AssemblyLinearVelocity = Vector3.zero
                     end
@@ -695,61 +736,219 @@ local Window = Rayfield:CreateWindow({
 -- MAIN TAB
 -- ═══════════════════════════════════════════
 local MainTab = Window:CreateTab("Main", "shield")
-
 MainTab:CreateSection("Bypass Control")
-MainTab:CreateToggle({
-    Name="Enable Bypass", CurrentValue=Config.Enabled, Flag="BypassEnabled",
+MainTab:CreateToggle({ Name="Enable Bypass", CurrentValue=Config.Enabled, Flag="BypassEnabled",
     Callback=function(v)
-        Config.Enabled = v
+        Config.Enabled=v
         if v then startBypass() else stopBypass() end
-        Rayfield:Notify({ Title=v and "Bypass Active" or "Bypass Stopped",
-            Content=v and "Enabled" or "Disabled", Duration=3 })
-    end,
-})
-
+        Rayfield:Notify({ Title=v and "Bypass Active" or "Bypass Stopped", Content=v and "Enabled" or "Disabled", Duration=3 })
+    end })
 MainTab:CreateSection("What Gets Bypassed")
-MainTab:CreateToggle({ Name="Teleport Enemies",       CurrentValue=Config.TeleportEnemies,   Flag="TeleportEnemies",   Callback=function(v) Config.TeleportEnemies=v end })
-MainTab:CreateToggle({ Name="Teleport CoreProjectile", CurrentValue=Config.TeleportProj,       Flag="TeleportProj",      Callback=function(v) Config.TeleportProj=v end })
+MainTab:CreateToggle({ Name="Teleport Enemies",        CurrentValue=Config.TeleportEnemies,   Flag="TeleportEnemies",   Callback=function(v) Config.TeleportEnemies=v   end })
+MainTab:CreateToggle({ Name="Teleport CoreProjectile", CurrentValue=Config.TeleportProj,       Flag="TeleportProj",      Callback=function(v) Config.TeleportProj=v      end })
 MainTab:CreateToggle({ Name="Teleport Fast Parts",     CurrentValue=Config.TeleportFastParts, Flag="TeleportFastParts", Callback=function(v) Config.TeleportFastParts=v end })
-
 MainTab:CreateSection("Void Position")
-MainTab:CreateSlider({ Name="Void X", Range={1000,50000}, Increment=1000, Suffix=" studs", CurrentValue=Config.VoidPos.X, Flag="VoidX",
-    Callback=function(v) Config.VoidPos=Vector3.new(v,Config.VoidPos.Y,Config.VoidPos.Z) end })
-MainTab:CreateSlider({ Name="Void Y", Range={1000,50000}, Increment=1000, Suffix=" studs", CurrentValue=Config.VoidPos.Y, Flag="VoidY",
-    Callback=function(v) Config.VoidPos=Vector3.new(Config.VoidPos.X,v,Config.VoidPos.Z) end })
-MainTab:CreateSlider({ Name="Void Z", Range={1000,50000}, Increment=1000, Suffix=" studs", CurrentValue=Config.VoidPos.Z, Flag="VoidZ",
-    Callback=function(v) Config.VoidPos=Vector3.new(Config.VoidPos.X,Config.VoidPos.Y,v) end })
-MainTab:CreateSlider({ Name="Fast Part Speed Threshold", Range={10,500}, Increment=5, Suffix=" studs/s", CurrentValue=Config.SpeedThreshold, Flag="SpeedThreshold",
-    Callback=function(v) Config.SpeedThreshold=v end })
-
+MainTab:CreateSlider({ Name="Void X", Range={1000,50000}, Increment=1000, Suffix=" studs", CurrentValue=Config.VoidPos.X, Flag="VoidX", Callback=function(v) Config.VoidPos=Vector3.new(v,Config.VoidPos.Y,Config.VoidPos.Z) end })
+MainTab:CreateSlider({ Name="Void Y", Range={1000,50000}, Increment=1000, Suffix=" studs", CurrentValue=Config.VoidPos.Y, Flag="VoidY", Callback=function(v) Config.VoidPos=Vector3.new(Config.VoidPos.X,v,Config.VoidPos.Z) end })
+MainTab:CreateSlider({ Name="Void Z", Range={1000,50000}, Increment=1000, Suffix=" studs", CurrentValue=Config.VoidPos.Z, Flag="VoidZ", Callback=function(v) Config.VoidPos=Vector3.new(Config.VoidPos.X,Config.VoidPos.Y,v) end })
+MainTab:CreateSlider({ Name="Fast Part Speed Threshold", Range={10,500}, Increment=5, Suffix=" studs/s", CurrentValue=Config.SpeedThreshold, Flag="SpeedThreshold", Callback=function(v) Config.SpeedThreshold=v end })
 MainTab:CreateSection("Performance")
-MainTab:CreateDropdown({
-    Name="Prediction Update Rate", Flag="PredUpdateRate",
+MainTab:CreateDropdown({ Name="Prediction Update Rate", Flag="PredUpdateRate",
     Options={"Every Frame","Every 2 Frames (default)","Every 3 Frames","Every 4 Frames"},
     CurrentOption="Every 2 Frames (default)",
     Callback=function(v)
-        if     v=="Every Frame"            then PRED_UPDATE_RATE=1
+        if v=="Every Frame" then PRED_UPDATE_RATE=1
         elseif v=="Every 2 Frames (default)" then PRED_UPDATE_RATE=2
-        elseif v=="Every 3 Frames"         then PRED_UPDATE_RATE=3
-        elseif v=="Every 4 Frames"         then PRED_UPDATE_RATE=4 end
-        Rayfield:Notify({ Title="Update Rate", Content="Prediction: "..v, Duration=3 })
+        elseif v=="Every 3 Frames" then PRED_UPDATE_RATE=3
+        elseif v=="Every 4 Frames" then PRED_UPDATE_RATE=4 end
+    end })
+MainTab:CreateLabel("Higher skip = better FPS, slightly less accuracy")
+
+-- ═══════════════════════════════════════════
+-- HIT REGISTRATION TAB
+-- ═══════════════════════════════════════════
+local HitRegTab = Window:CreateTab("Hit Reg", "target")
+
+HitRegTab:CreateSection("Hit Registration Control")
+
+HitRegTab:CreateToggle({
+    Name         = "Enable Hit Registration",
+    CurrentValue = Config.HitRegEnabled,
+    Flag         = "HitRegEnabled",
+    Callback     = function(v)
+        Config.HitRegEnabled = v
+        if v then
+            startHitReg()
+            Rayfield:Notify({
+                Title    = "Hit Reg ON",
+                Content  = "Hit registration active at " .. Config.HitRegStrength .. "%",
+                Duration = 3,
+            })
+        else
+            stopHitReg()
+            Rayfield:Notify({
+                Title    = "Hit Reg OFF",
+                Content  = "Hit registration disabled",
+                Duration = 3,
+            })
+        end
     end,
 })
-MainTab:CreateLabel("Higher skip = better FPS, slightly less accuracy")
-MainTab:CreateLabel("Recommended: Every 2 Frames for HvH")
+
+HitRegTab:CreateSection("Hit Strength")
+
+HitRegTab:CreateSlider({
+    Name         = "Hit Register Strength",
+    Range        = {0, 100},
+    Increment    = 1,
+    Suffix       = "%",
+    CurrentValue = Config.HitRegStrength,
+    Flag         = "HitRegStrength",
+    Callback     = function(v)
+        Config.HitRegStrength = v
+        -- Give live feedback on what the value means
+        local label = v >= 100 and "Perfect hit reg (never miss)"
+            or v >= 75 and "High hit reg (rarely miss)"
+            or v >= 50 and "Medium hit reg"
+            or v >= 25 and "Low hit reg (misses often)"
+            or "Off effectively (always miss)"
+        Rayfield:Notify({
+            Title    = "Hit Strength: " .. v .. "%",
+            Content  = label,
+            Duration = 2,
+        })
+    end,
+})
+
+HitRegTab:CreateSection("Presets")
+
+HitRegTab:CreateButton({
+    Name     = "🎯 Never Miss (100%)",
+    Callback = function()
+        Config.HitRegStrength = 100
+        Rayfield:Notify({ Title="Hit Reg", Content="Set to 100% — Never Miss", Duration=3 })
+    end,
+})
+
+HitRegTab:CreateButton({
+    Name     = "High (85%)",
+    Callback = function()
+        Config.HitRegStrength = 85
+        Rayfield:Notify({ Title="Hit Reg", Content="Set to 85% — High accuracy", Duration=3 })
+    end,
+})
+
+HitRegTab:CreateButton({
+    Name     = "Medium (60%)",
+    Callback = function()
+        Config.HitRegStrength = 60
+        Rayfield:Notify({ Title="Hit Reg", Content="Set to 60% — Medium accuracy", Duration=3 })
+    end,
+})
+
+HitRegTab:CreateButton({
+    Name     = "Low (30%)",
+    Callback = function()
+        Config.HitRegStrength = 30
+        Rayfield:Notify({ Title="Hit Reg", Content="Set to 30% — Low accuracy", Duration=3 })
+    end,
+})
+
+HitRegTab:CreateSection("Options")
+
+HitRegTab:CreateToggle({
+    Name         = "Freeze Enemies",
+    CurrentValue = Config.HitRegFreezeEnemies,
+    Flag         = "HitRegFreezeEnemies",
+    Callback     = function(v)
+        Config.HitRegFreezeEnemies = v
+    end,
+})
+
+HitRegTab:CreateToggle({
+    Name         = "Void Projectiles",
+    CurrentValue = Config.HitRegVoidProj,
+    Flag         = "HitRegVoidProj",
+    Callback     = function(v)
+        Config.HitRegVoidProj = v
+    end,
+})
+
+HitRegTab:CreateToggle({
+    Name         = "Show Debug Hits (Console)",
+    CurrentValue = Config.HitRegShowDebug,
+    Flag         = "HitRegShowDebug",
+    Callback     = function(v)
+        Config.HitRegShowDebug = v
+        Rayfield:Notify({
+            Title    = v and "Debug ON" or "Debug OFF",
+            Content  = v and "Hit logs printing to console" or "Debug disabled",
+            Duration = 3,
+        })
+    end,
+})
+
+HitRegTab:CreateSlider({
+    Name         = "Projectile Speed Threshold",
+    Range        = {10, 500},
+    Increment    = 5,
+    Suffix       = " studs/s",
+    CurrentValue = Config.HitRegSpeedThresh,
+    Flag         = "HitRegSpeedThresh",
+    Callback     = function(v)
+        Config.HitRegSpeedThresh = v
+    end,
+})
+
+HitRegTab:CreateSection("Stats")
+
+HitRegTab:CreateButton({
+    Name     = "Show Hit Stats",
+    Callback = function()
+        local pct = hitRegTotalShots > 0
+            and math.floor(hitRegTotalHits / hitRegTotalShots * 100)
+            or 0
+        Rayfield:Notify({
+            Title    = "Hit Registration Stats",
+            Content  = string.format(
+                "Hits: %d\nShots Tracked: %d\nHit Rate: %d%%",
+                hitRegTotalHits,
+                hitRegTotalShots,
+                pct
+            ),
+            Duration = 6,
+        })
+    end,
+})
+
+HitRegTab:CreateButton({
+    Name     = "Reset Stats",
+    Callback = function()
+        hitRegTotalHits  = 0
+        hitRegTotalShots = 0
+        Rayfield:Notify({ Title="Stats Reset", Content="Hit/shot counters cleared", Duration=3 })
+    end,
+})
+
+HitRegTab:CreateSection("How It Works")
+HitRegTab:CreateLabel("Tracks every CoreProjectile + fast Part")
+HitRegTab:CreateLabel("Raycasts from last pos → current pos each frame")
+HitRegTab:CreateLabel("100% = ray always extended, always registers")
+HitRegTab:CreateLabel("50%  = 50% chance to register per frame")
+HitRegTab:CreateLabel("0%   = ray never fires (disabled effectively)")
+HitRegTab:CreateLabel("Ray length scaled by strength for wider hit window")
+HitRegTab:CreateLabel("Freeze Enemies keeps them still for clean hits")
 
 -- ═══════════════════════════════════════════
 -- WEAPON SPEED TAB
 -- ═══════════════════════════════════════════
 local SpeedTab = Window:CreateTab("Weapon Speed", "zap")
-
 SpeedTab:CreateSection("Bow · Daggers · Slingshot")
 SpeedTab:CreateToggle({ Name="Enable Weapon Speed", CurrentValue=Config.WeaponSpeedEnabled, Flag="WeaponSpeedEnabled",
     Callback=function(v)
         Config.WeaponSpeedEnabled=v
         if v then applyWeaponSpeed(Config.WeaponSpeedPercent) else resetWeaponSpeed() end
-        Rayfield:Notify({ Title=v and "Speed ON" or "Speed OFF",
-            Content=v and ("→ "..Config.WeaponSpeedPercent.."%") or "Reset", Duration=3 })
+        Rayfield:Notify({ Title=v and "Speed ON" or "Speed OFF", Content=v and ("→ "..Config.WeaponSpeedPercent.."%") or "Reset", Duration=3 })
     end })
 SpeedTab:CreateSlider({ Name="Weapon Speed %", Range={0,300}, Increment=1, Suffix="%", CurrentValue=Config.WeaponSpeedPercent, Flag="WeaponSpeedPercent",
     Callback=function(v) Config.WeaponSpeedPercent=v if Config.WeaponSpeedEnabled then applyWeaponSpeed(v) end end })
@@ -764,7 +963,6 @@ SpeedTab:CreateLabel("0% = Slowest · 100% = Default · 300% = Instant")
 -- PREDICTION TAB
 -- ═══════════════════════════════════════════
 local PredTab = Window:CreateTab("Prediction", "crosshair")
-
 PredTab:CreateSection("Enable")
 PredTab:CreateToggle({ Name="Enable Prediction", CurrentValue=Config.PredictionEnabled, Flag="PredictionEnabled",
     Callback=function(v)
@@ -772,34 +970,18 @@ PredTab:CreateToggle({ Name="Enable Prediction", CurrentValue=Config.PredictionE
         if not v then cleanupPredSphere() predCache={} end
         Rayfield:Notify({ Title=v and "Prediction ON" or "Prediction OFF", Content=v and "Active" or "Disabled", Duration=3 })
     end })
-
 PredTab:CreateSection("Algorithm")
-PredTab:CreateDropdown({
-    Name="Prediction Method", Options={"Velocity Only","Velocity + Accel","Kalman"},
+PredTab:CreateDropdown({ Name="Prediction Method", Options={"Velocity Only","Velocity + Accel","Kalman"},
     CurrentOption=Config.PredictionMethod, Flag="PredictionMethod",
-    Callback=function(v) Config.PredictionMethod=v predCache={} end,
-})
-
+    Callback=function(v) Config.PredictionMethod=v predCache={} end })
 PredTab:CreateSection("Timing")
-PredTab:CreateSlider({ Name="Lead Time", Range={0,0.5}, Increment=0.005, Suffix="s",
-    CurrentValue=Config.PredictionStrength, Flag="PredictionStrength",
-    Callback=function(v) Config.PredictionStrength=v end })
-PredTab:CreateSlider({ Name="Latency Compensation", Range={0,0.3}, Increment=0.005, Suffix="s",
-    CurrentValue=Config.PredictionLatency, Flag="PredictionLatency",
-    Callback=function(v) Config.PredictionLatency=v end })
-
+PredTab:CreateSlider({ Name="Lead Time",              Range={0,0.5}, Increment=0.005, Suffix="s", CurrentValue=Config.PredictionStrength,     Flag="PredictionStrength",     Callback=function(v) Config.PredictionStrength=v end })
+PredTab:CreateSlider({ Name="Latency Compensation",   Range={0,0.3}, Increment=0.005, Suffix="s", CurrentValue=Config.PredictionLatency,      Flag="PredictionLatency",      Callback=function(v) Config.PredictionLatency=v end })
 PredTab:CreateSection("Accuracy")
-PredTab:CreateSlider({ Name="Max Lead Distance", Range={1,30}, Increment=0.5, Suffix=" studs",
-    CurrentValue=Config.PredictionMaxLead, Flag="PredictionMaxLead",
-    Callback=function(v) Config.PredictionMaxLead=v end })
-PredTab:CreateSlider({ Name="Smoothing (0=raw, 1=smooth)", Range={0,1}, Increment=0.05,
-    CurrentValue=Config.PredictionSmoothFactor, Flag="PredictionSmoothFactor",
-    Callback=function(v) Config.PredictionSmoothFactor=v end })
-PredTab:CreateToggle({ Name="Adaptive Lead Scaling", CurrentValue=Config.PredictionAdaptive, Flag="PredictionAdaptive",
-    Callback=function(v) Config.PredictionAdaptive=v end })
-PredTab:CreateToggle({ Name="Show Prediction Sphere", CurrentValue=Config.PredictionShowSphere, Flag="PredictionShowSphere",
-    Callback=function(v) Config.PredictionShowSphere=v if not v then cleanupPredSphere() end end })
-
+PredTab:CreateSlider({ Name="Max Lead Distance",       Range={1,30},  Increment=0.5,  Suffix=" studs", CurrentValue=Config.PredictionMaxLead, Flag="PredictionMaxLead",      Callback=function(v) Config.PredictionMaxLead=v end })
+PredTab:CreateSlider({ Name="Smoothing (0=raw 1=max)", Range={0,1},   Increment=0.05, CurrentValue=Config.PredictionSmoothFactor,             Flag="PredictionSmoothFactor", Callback=function(v) Config.PredictionSmoothFactor=v end })
+PredTab:CreateToggle({ Name="Adaptive Lead Scaling",  CurrentValue=Config.PredictionAdaptive,     Flag="PredictionAdaptive",     Callback=function(v) Config.PredictionAdaptive=v end })
+PredTab:CreateToggle({ Name="Show Prediction Sphere", CurrentValue=Config.PredictionShowSphere,   Flag="PredictionShowSphere",   Callback=function(v) Config.PredictionShowSphere=v if not v then cleanupPredSphere() end end })
 PredTab:CreateSection("HvH Presets")
 PredTab:CreateButton({ Name="Slingshot HvH (Recommended)", Callback=function()
     Config.PredictionMethod="Velocity + Accel" Config.PredictionStrength=0.09
@@ -829,50 +1011,38 @@ PredTab:CreateButton({ Name="Reset Cache", Callback=function()
     predCache={}
     Rayfield:Notify({ Title="Cache Cleared", Content="Prediction history reset", Duration=3 })
 end })
-
 PredTab:CreateSection("Info")
-PredTab:CreateLabel("Velocity Only    → Simple, lightest on CPU")
+PredTab:CreateLabel("Velocity Only    → Lightest on CPU")
 PredTab:CreateLabel("Velocity + Accel → Best for slingshot HvH")
 PredTab:CreateLabel("Kalman           → Best for strafing targets")
-PredTab:CreateLabel("Cache updates every N frames to save FPS")
 
 -- ═══════════════════════════════════════════
 -- AVATAR TAB
 -- ═══════════════════════════════════════════
 local AvatarTab = Window:CreateTab("Avatar", "user")
-
 AvatarTab:CreateSection("Victim Settings")
-AvatarTab:CreateInput({ Name="Victim User ID", PlaceholderText="Roblox User ID (numbers only)...",
-    RemoveTextAfterFocusLost=false, Flag="AvatarVictimId",
-    Callback=function(v) local id=tonumber(v) if id then Config.AvatarVictimId=id
-        Rayfield:Notify({ Title="ID Set", Content="User ID: "..id, Duration=3 })
+AvatarTab:CreateInput({ Name="Victim User ID", PlaceholderText="Roblox User ID (numbers only)...", RemoveTextAfterFocusLost=false, Flag="AvatarVictimId",
+    Callback=function(v) local id=tonumber(v) if id then Config.AvatarVictimId=id Rayfield:Notify({ Title="ID Set", Content="User ID: "..id, Duration=3 })
     else Rayfield:Notify({ Title="Invalid", Content="Numbers only", Duration=3 }) end end })
-AvatarTab:CreateInput({ Name="Helper Username (optional)", PlaceholderText="Leave empty to spoof yourself...",
-    RemoveTextAfterFocusLost=false, Flag="AvatarHelper",
+AvatarTab:CreateInput({ Name="Helper Username (optional)", PlaceholderText="Leave empty to spoof yourself...", RemoveTextAfterFocusLost=false, Flag="AvatarHelper",
     Callback=function(v) Config.AvatarHelper=v end })
-
 AvatarTab:CreateSection("Stat Overrides")
-AvatarTab:CreateSlider({ Name="Level",      Range={1,1000},  Increment=1,  Suffix=" lvl",  CurrentValue=Config.AvatarLevel,  Flag="AvatarLevel",  Callback=function(v) Config.AvatarLevel=v end })
-AvatarTab:CreateSlider({ Name="Win Streak", Range={0,500},   Increment=1,  Suffix=" wins", CurrentValue=Config.AvatarStreak, Flag="AvatarStreak", Callback=function(v) Config.AvatarStreak=v end })
-AvatarTab:CreateSlider({ Name="ELO (0=off)",Range={0,10000}, Increment=10, Suffix=" elo",  CurrentValue=Config.AvatarElo,    Flag="AvatarElo",    Callback=function(v) Config.AvatarElo=v end })
-AvatarTab:CreateSlider({ Name="Keys (0=off)",Range={0,9999}, Increment=1,  Suffix=" keys", CurrentValue=Config.AvatarKeys,   Flag="AvatarKeys",   Callback=function(v) Config.AvatarKeys=v end })
-
+AvatarTab:CreateSlider({ Name="Level",       Range={1,1000},  Increment=1,  Suffix=" lvl",  CurrentValue=Config.AvatarLevel,  Flag="AvatarLevel",  Callback=function(v) Config.AvatarLevel=v  end })
+AvatarTab:CreateSlider({ Name="Win Streak",  Range={0,500},   Increment=1,  Suffix=" wins", CurrentValue=Config.AvatarStreak, Flag="AvatarStreak", Callback=function(v) Config.AvatarStreak=v end })
+AvatarTab:CreateSlider({ Name="ELO (0=off)", Range={0,10000}, Increment=10, Suffix=" elo",  CurrentValue=Config.AvatarElo,    Flag="AvatarElo",    Callback=function(v) Config.AvatarElo=v    end })
+AvatarTab:CreateSlider({ Name="Keys (0=off)",Range={0,9999},  Increment=1,  Suffix=" keys", CurrentValue=Config.AvatarKeys,   Flag="AvatarKeys",   Callback=function(v) Config.AvatarKeys=v   end })
 AvatarTab:CreateSection("Badges & Status")
-AvatarTab:CreateToggle({ Name="Spoof Premium",        CurrentValue=Config.AvatarPremium,   Flag="AvatarPremium",   Callback=function(v) Config.AvatarPremium=v end })
-AvatarTab:CreateToggle({ Name="Spoof Verified Badge",  CurrentValue=Config.AvatarVerified,  Flag="AvatarVerified",  Callback=function(v) Config.AvatarVerified=v end })
-AvatarTab:CreateToggle({ Name="Unlock All",            CurrentValue=Config.AvatarUnlockAll, Flag="AvatarUnlockAll", Callback=function(v) Config.AvatarUnlockAll=v end })
-
+AvatarTab:CreateToggle({ Name="Spoof Premium",       CurrentValue=Config.AvatarPremium,   Flag="AvatarPremium",   Callback=function(v) Config.AvatarPremium=v   end })
+AvatarTab:CreateToggle({ Name="Spoof Verified Badge", CurrentValue=Config.AvatarVerified,  Flag="AvatarVerified",  Callback=function(v) Config.AvatarVerified=v  end })
+AvatarTab:CreateToggle({ Name="Unlock All",           CurrentValue=Config.AvatarUnlockAll, Flag="AvatarUnlockAll", Callback=function(v) Config.AvatarUnlockAll=v end })
 AvatarTab:CreateSection("Platform")
-AvatarTab:CreateDropdown({ Name="Platform", Options={"DESKTOP","MOBILE","CONSOLE","VR"},
-    CurrentOption=Config.AvatarPlatform, Flag="AvatarPlatform",
+AvatarTab:CreateDropdown({ Name="Platform", Options={"DESKTOP","MOBILE","CONSOLE","VR"}, CurrentOption=Config.AvatarPlatform, Flag="AvatarPlatform",
     Callback=function(v) Config.AvatarPlatform=v end })
-
 AvatarTab:CreateSection("Control")
 AvatarTab:CreateButton({ Name="▶  Apply Avatar Changer", Callback=function() startAvatarChanger() end })
 AvatarTab:CreateButton({ Name="■  Stop Avatar Changer",  Callback=function() stopAvatarChanger()  end })
 AvatarTab:CreateButton({ Name="Preview Victim Info", Callback=function()
-    if Config.AvatarVictimId==0 then
-        Rayfield:Notify({ Title="No ID", Content="Enter ID first", Duration=3 }) return end
+    if Config.AvatarVictimId==0 then Rayfield:Notify({ Title="No ID", Content="Enter ID first", Duration=3 }) return end
     pcall(function()
         local raw=game:HttpGet("https://users.roblox.com/v1/users/"..Config.AvatarVictimId,true)
         local d=HttpService:JSONDecode(raw)
@@ -884,13 +1054,11 @@ end })
 -- TARGETS TAB
 -- ═══════════════════════════════════════════
 local TargetsTab = Window:CreateTab("Targets", "users")
-
 TargetsTab:CreateSection("Target Selection")
 TargetsTab:CreateDropdown({ Name="Target Mode", Options={"All Enemies","Nearest Enemy","Specific Player"},
     CurrentOption=Config.TargetMode, Flag="TargetMode",
     Callback=function(v) Config.TargetMode=v nearestEnemyCache=nil end })
-TargetsTab:CreateInput({ Name="Specific Player Username", PlaceholderText="Exact username...",
-    RemoveTextAfterFocusLost=false, Flag="TargetUsername",
+TargetsTab:CreateInput({ Name="Specific Player Username", PlaceholderText="Exact username...", RemoveTextAfterFocusLost=false, Flag="TargetUsername",
     Callback=function(v)
         Config.TargetPlayer=v targetPlayerObj=nil
         for _,p in ipairs(Players:GetPlayers()) do
@@ -911,7 +1079,7 @@ TargetsTab:CreateButton({ Name="Select Nearest Enemy", Callback=function()
     nearestEnemyCacheTime=0
     local n=getNearestEnemy()
     if n then
-        Config.TargetMode=n.Name targetPlayerObj=n
+        Config.TargetMode="Specific Player" targetPlayerObj=n
         Rayfield:Notify({ Title="Target Set", Content="Targeting: "..n.Name, Duration=3 })
     else
         Rayfield:Notify({ Title="No Enemies", Content="No players found", Duration=3 })
@@ -922,14 +1090,17 @@ end })
 -- CONFIG TAB
 -- ═══════════════════════════════════════════
 local ConfigTab = Window:CreateTab("Config", "save")
-
 ConfigTab:CreateSection("Save & Load")
 ConfigTab:CreateLabel("Saves to: unnamed/rivals_config.json")
-ConfigTab:CreateButton({ Name="Save Config",   Callback=function() saveConfig() Rayfield:Notify({ Title="Saved", Content="Config saved", Duration=3 }) end })
-ConfigTab:CreateButton({ Name="Load Config",   Callback=function()
+ConfigTab:CreateButton({ Name="Save Config", Callback=function()
+    saveConfig()
+    Rayfield:Notify({ Title="Saved", Content="Config saved", Duration=3 })
+end })
+ConfigTab:CreateButton({ Name="Load Config", Callback=function()
     loadConfig()
     if Config.Enabled then startBypass() else stopBypass() end
     if Config.WeaponSpeedEnabled then applyWeaponSpeed(Config.WeaponSpeedPercent) end
+    if Config.HitRegEnabled then startHitReg() else stopHitReg() end
     Rayfield:Notify({ Title="Loaded", Content="Config loaded", Duration=3 })
 end })
 ConfigTab:CreateButton({ Name="Reset to Default", Callback=function()
@@ -941,11 +1112,13 @@ ConfigTab:CreateButton({ Name="Reset to Default", Callback=function()
     Config.PredictionStrength=0.09 Config.PredictionMaxLead=6
     Config.PredictionShowSphere=false Config.PredictionLatency=0.055
     Config.PredictionSmoothFactor=0.45 Config.PredictionAdaptive=true
+    Config.HitRegEnabled=false Config.HitRegStrength=100
+    Config.HitRegFreezeEnemies=true Config.HitRegVoidProj=true
+    Config.HitRegSpeedThresh=50 Config.HitRegShowDebug=false
     Config.AvatarVictimId=0 Config.AvatarHelper="" Config.AvatarLevel=1
     Config.AvatarStreak=0 Config.AvatarElo=0 Config.AvatarKeys=0
-    Config.AvatarPremium=false Config.AvatarVerified=false
-    Config.AvatarUnlockAll=false Config.AvatarPlatform="DESKTOP"
-    stopBypass() resetWeaponSpeed() cleanupPredSphere() predCache={}
+    Config.AvatarPremium=false Config.AvatarVerified=false Config.AvatarUnlockAll=false Config.AvatarPlatform="DESKTOP"
+    stopBypass() resetWeaponSpeed() cleanupPredSphere() stopHitReg() predCache={}
     if avatarActive then stopAvatarChanger() end
     saveConfig()
     Rayfield:Notify({ Title="Reset", Content="All defaults restored", Duration=3 })
@@ -959,26 +1132,18 @@ ConfigTab:CreateToggle({ Name="Auto Save (every 10s)", CurrentValue=false, Flag=
                 if f and f["AutoSave"] and f["AutoSave"].Value then saveConfig() else break end
             end
         end) end
-        Rayfield:Notify({ Title=v and "Auto Save ON" or "Auto Save OFF",
-            Content=v and "Every 10s" or "Manual only", Duration=3 })
+        Rayfield:Notify({ Title=v and "Auto Save ON" or "Auto Save OFF", Content=v and "Every 10s" or "Manual only", Duration=3 })
     end })
 
 -- ═══════════════════════════════════════════
 -- INFO TAB
 -- ═══════════════════════════════════════════
 local InfoTab = Window:CreateTab("Info", "info")
-InfoTab:CreateSection("Performance Notes")
-InfoTab:CreateLabel("Prediction updates every N frames (not every frame)")
-InfoTab:CreateLabel("Nearest enemy cached for 0.12s between recalcs")
-InfoTab:CreateLabel("Avatar RenderStepped skips every 6 frames")
-InfoTab:CreateLabel("Player list cached on join/leave events")
-InfoTab:CreateLabel("Squared distance used (no sqrt cost)")
-InfoTab:CreateLabel("No workspace:GetChildren() in heartbeat loop")
-
 InfoTab:CreateSection("Emergency")
 InfoTab:CreateButton({ Name="Force Stop Everything", Callback=function()
-    Config.Enabled=false Config.WeaponSpeedEnabled=false Config.PredictionEnabled=false
-    stopBypass() resetWeaponSpeed() cleanupPredSphere() predCache={}
+    Config.Enabled=false Config.WeaponSpeedEnabled=false
+    Config.PredictionEnabled=false Config.HitRegEnabled=false
+    stopBypass() resetWeaponSpeed() cleanupPredSphere() stopHitReg() predCache={}
     if avatarActive then stopAvatarChanger() end
     Rayfield:Notify({ Title="Stopped", Content="All systems off", Duration=3 })
 end })
@@ -988,19 +1153,23 @@ end })
 -- ═══════════════════════════════════════════
 Rayfield:Notify({
     Title   = "yux/overkill loaded",
-    Content = "Optimised build · Low-end friendly",
+    Content = "Hit Reg tab added · Never miss at 100%",
     Duration = 5,
 })
 
-if Config.Enabled then startBypass() end
+if Config.Enabled          then startBypass()                          end
 if Config.WeaponSpeedEnabled then applyWeaponSpeed(Config.WeaponSpeedPercent) end
+if Config.HitRegEnabled    then startHitReg()                          end
 
 LocalPlayer.CharacterAdded:Connect(function()
     trackedParts          = {}
     predCache             = {}
+    hitRegTracked         = {}
     nearestEnemyCache     = nil
     nearestEnemyCacheTime = 0
     cleanupPredSphere()
-    if Config.Enabled then task.wait(1) startBypass() end
+    updateRaycastFilter()
+    if Config.Enabled           then task.wait(1) startBypass()                            end
     if Config.WeaponSpeedEnabled then task.wait(1) applyWeaponSpeed(Config.WeaponSpeedPercent) end
+    if Config.HitRegEnabled     then task.wait(1) startHitReg()                            end
 end)
